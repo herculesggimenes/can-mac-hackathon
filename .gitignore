@@ -3,3 +3,11 @@ __pycache__/
 *.pyc
 target/
 MUJOCO_LOG.TXT
+HARD_STOP
+Log/
+logs/
+recordings/
+lerobot-data/
+outputs/
+*.log
+*.pid
