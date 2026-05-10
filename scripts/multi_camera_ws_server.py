@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import multiprocessing as mp
 import threading
 import time
 from dataclasses import dataclass
@@ -55,7 +56,7 @@ def _parse_camera_specs(value: str) -> list[CameraSpec]:
             int(value_text)
             specs.append(CameraSpec(camera_id=camera_id, driver=driver, value=value_text))
         elif driver == "orbbec":
-            modes = ["color", "depth", "ir", "left_ir", "right_ir", "dual_ir"] if value_text == "all" else [value_text]
+            modes = ["color", "depth", "ir"] if value_text == "all" else [value_text]
             valid_modes = {"color", "depth", "ir", "left_ir", "right_ir", "dual_ir"}
             for mode in modes:
                 if mode not in valid_modes:
@@ -181,7 +182,48 @@ class OpenCvCameraFeed:
 
 
 def _orbbec_video_profile(pipeline, sensor_type):
+    from pyorbbecsdk import OBFormat, OBSensorType
+
     profile_list = pipeline.get_stream_profile_list(sensor_type)
+    preferred = {
+        OBSensorType.COLOR_SENSOR: [
+            (640, 360, 5, OBFormat.MJPG),
+            (640, 480, 5, OBFormat.MJPG),
+            (640, 360, 10, OBFormat.MJPG),
+            (640, 480, 10, OBFormat.MJPG),
+            (640, 360, 5, OBFormat.YUYV),
+            (640, 480, 5, OBFormat.YUYV),
+        ],
+        OBSensorType.DEPTH_SENSOR: [
+            (640, 400, 5, OBFormat.Y16),
+            (640, 400, 10, OBFormat.Y16),
+            (320, 200, 5, OBFormat.Y16),
+            (320, 200, 10, OBFormat.Y16),
+        ],
+        OBSensorType.IR_SENSOR: [
+            (640, 400, 5, OBFormat.Y8),
+            (640, 400, 10, OBFormat.Y8),
+            (320, 200, 5, OBFormat.Y8),
+            (320, 200, 10, OBFormat.Y8),
+        ],
+    }
+    profiles = []
+    try:
+        count = profile_list.get_count()
+        for index in range(count):
+            profile = profile_list.get_stream_profile_by_index(index).as_video_stream_profile()
+            profiles.append(profile)
+    except Exception:
+        pass
+    for width, height, fps, fmt in preferred.get(sensor_type, []):
+        for profile in profiles:
+            if (
+                profile.get_width() == width
+                and profile.get_height() == height
+                and profile.get_fps() == fps
+                and profile.get_format() == fmt
+            ):
+                return profile
     return profile_list.get_default_video_stream_profile()
 
 
@@ -220,10 +262,14 @@ def _orbbec_depth_image(frame):
     import numpy as np
     from pyorbbecsdk import OBFormat
 
-    if frame is None or frame.get_format() != OBFormat.Y16:
+    if frame is None:
         return None
+    frame = frame.as_video_frame()
     width = frame.get_width()
     height = frame.get_height()
+    fmt = frame.get_format()
+    if fmt not in (OBFormat.Y16, OBFormat.Y14, OBFormat.RLE):
+        return None
     depth = np.frombuffer(frame.get_data(), dtype=np.uint16).reshape((height, width))
     depth = np.where((depth > 20) & (depth < 10000), depth, 0).astype(np.uint16)
     normalized = cv2.normalize(depth, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
@@ -255,6 +301,17 @@ def _orbbec_color_image(frame):
     return None
 
 
+def _orbbec_color_jpeg(frame) -> bytes | None:
+    from pyorbbecsdk import OBFormat
+
+    if frame is None:
+        return None
+    frame = frame.as_video_frame()
+    if frame.get_format() != OBFormat.MJPG:
+        return None
+    return bytes(frame.get_data())
+
+
 class OrbbecSdkFeed:
     def __init__(self, specs: list[CameraSpec], *, quality: int):
         self.specs = specs
@@ -264,7 +321,9 @@ class OrbbecSdkFeed:
         self.latest_t: dict[str, float] = {}
         self.errors: dict[str, str] = {}
         self.stop = threading.Event()
-        self.pipeline = None
+        self.process: mp.Process | None = None
+        self.queue: mp.Queue | None = None
+        self._logged_modes: set[str] = set()
 
     def start(self) -> threading.Thread:
         thread = threading.Thread(target=self.run, name="camera-orbbec-sdk", daemon=True)
@@ -278,6 +337,57 @@ class OrbbecSdkFeed:
         return [OrbbecLogicalFeed(self, spec) for spec in self.specs]
 
     def run(self) -> None:
+        self.queue = mp.Queue(maxsize=16)
+        specs_data = [(spec.camera_id, spec.value) for spec in self.specs]
+        self.process = mp.Process(target=_orbbec_worker, args=(specs_data, self.quality, self.queue), daemon=True)
+        self.process.start()
+        while not self.stop.is_set():
+            if self.process is not None and not self.process.is_alive():
+                with self.lock:
+                    for spec in self.specs:
+                        self.errors.setdefault(spec.camera_id, f"orbbec worker exited: {self.process.exitcode}")
+                return
+            try:
+                message = self.queue.get(timeout=0.25) if self.queue is not None else None
+            except Exception:
+                continue
+            if not message:
+                continue
+            kind = message.get("type")
+            if kind == "frame":
+                with self.lock:
+                    self.latest_jpegs[message["camera_id"]] = message["jpeg"]
+                    self.latest_t[message["camera_id"]] = message["captured_at"]
+                    self.errors.pop(message["camera_id"], None)
+            elif kind == "error":
+                with self.lock:
+                    self.errors[message["camera_id"]] = message["error"]
+
+    def close(self) -> None:
+        self.stop.set()
+        if self.process is not None and self.process.is_alive():
+            self.process.terminate()
+
+    def frame_payload(self, spec: CameraSpec) -> dict[str, Any]:
+        with self.lock:
+            jpeg = self.latest_jpegs.get(spec.camera_id)
+            captured_at = self.latest_t.get(spec.camera_id)
+            error = self.errors.get(spec.camera_id) or self.errors.get(spec.value)
+        return _jpeg_payload(spec.camera_id, f"orbbec:{spec.value}", jpeg, captured_at, error)
+
+
+def _orbbec_worker(specs_data: list[tuple[str, str]], quality: int, queue: mp.Queue) -> None:
+    try:
+        _run_orbbec_worker(specs_data, quality, queue)
+    except BaseException as exc:
+        for camera_id, _mode in specs_data:
+            try:
+                queue.put_nowait({"type": "error", "camera_id": camera_id, "error": str(exc)})
+            except Exception:
+                pass
+
+
+def _run_orbbec_worker(specs_data: list[tuple[str, str]], quality: int, queue: mp.Queue) -> None:
         import cv2
         from pyorbbecsdk import Config, OBFrameType, OBSensorType, Pipeline
 
@@ -289,64 +399,96 @@ class OrbbecSdkFeed:
             "right_ir": (OBSensorType.RIGHT_IR_SENSOR, OBFrameType.RIGHT_IR_FRAME, _orbbec_ir_image),
         }
         enabled: dict[str, tuple[Any, Any]] = {}
+        logged_modes: set[str] = set()
+        pipeline = Pipeline()
+        config = Config()
+        for _camera_id, value in specs_data:
+            modes = ("left_ir", "right_ir") if value == "dual_ir" else (value,)
+            for mode in modes:
+                if mode in enabled:
+                    continue
+                sensor_type, frame_type, decoder = mode_map[mode]
+                try:
+                    config.enable_stream(_orbbec_video_profile(pipeline, sensor_type))
+                    enabled[mode] = (frame_type, decoder)
+                except Exception as exc:
+                    queue.put({"type": "error", "camera_id": _camera_id, "error": str(exc)})
+        if not enabled:
+            raise RuntimeError("no Orbbec SDK streams could be enabled")
+        pipeline.start(config)
         try:
-            pipeline = Pipeline()
-            config = Config()
-            for spec in self.specs:
-                modes = ("left_ir", "right_ir") if spec.value == "dual_ir" else (spec.value,)
-                for mode in modes:
-                    if mode in enabled:
-                        continue
-                    sensor_type, frame_type, decoder = mode_map[mode]
-                    try:
-                        config.enable_stream(_orbbec_video_profile(pipeline, sensor_type))
-                        enabled[mode] = (frame_type, decoder)
-                    except Exception as exc:
-                        self.errors[mode] = str(exc)
-            if not enabled:
-                raise RuntimeError("no Orbbec SDK streams could be enabled")
-            pipeline.start(config)
-            self.pipeline = pipeline
-            while not self.stop.is_set():
+            while True:
                 frames = pipeline.wait_for_frames(1000)
                 if frames is None:
                     continue
-                for spec in self.specs:
+                for camera_id, value in specs_data:
                     try:
-                        if spec.value == "dual_ir":
-                            left = self._decode_orbbec_frame(frames, "left_ir", enabled)
-                            right = self._decode_orbbec_frame(frames, "right_ir", enabled)
+                        if value not in enabled and value != "dual_ir":
+                            continue
+                        if value == "dual_ir" and ("left_ir" not in enabled or "right_ir" not in enabled):
+                            continue
+                        raw_jpeg = None
+                        if value == "color":
+                            frame_type, _decoder = enabled[value]
+                            raw_jpeg = _orbbec_color_jpeg(frames.get_frame(frame_type))
+                        if raw_jpeg is not None:
+                            queue.put(
+                                {
+                                    "type": "frame",
+                                    "camera_id": camera_id,
+                                    "jpeg": raw_jpeg,
+                                    "captured_at": time.time(),
+                                }
+                            )
+                            continue
+                        if value == "dual_ir":
+                            left = _decode_orbbec_frame(frames, "left_ir", enabled, logged_modes)
+                            right = _decode_orbbec_frame(frames, "right_ir", enabled, logged_modes)
                             image = None if left is None or right is None else cv2.hconcat([left, right])
                         else:
-                            image = self._decode_orbbec_frame(frames, spec.value, enabled)
+                            image = _decode_orbbec_frame(frames, value, enabled, logged_modes)
                         if image is None:
                             continue
-                        ok, encoded = cv2.imencode(".jpg", image, [int(cv2.IMWRITE_JPEG_QUALITY), self.quality])
+                        ok, encoded = cv2.imencode(".jpg", image, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
                         if ok:
-                            with self.lock:
-                                self.latest_jpegs[spec.camera_id] = encoded.tobytes()
-                                self.latest_t[spec.camera_id] = time.time()
-                                self.errors.pop(spec.camera_id, None)
+                            queue.put(
+                                {
+                                    "type": "frame",
+                                    "camera_id": camera_id,
+                                    "jpeg": encoded.tobytes(),
+                                    "captured_at": time.time(),
+                                }
+                            )
                     except Exception as exc:
-                        with self.lock:
-                            self.errors[spec.camera_id] = str(exc)
-        except Exception as exc:
-            with self.lock:
-                for spec in self.specs:
-                    self.errors[spec.camera_id] = str(exc)
+                        queue.put({"type": "error", "camera_id": camera_id, "error": str(exc)})
         finally:
-            if self.pipeline is not None:
-                try:
-                    self.pipeline.stop()
-                except Exception:
-                    pass
-                self.pipeline = None
+            pipeline.stop()
 
-    def _decode_orbbec_frame(self, frames, mode: str, enabled: dict[str, tuple[Any, Any]]):
-        if mode not in enabled:
-            return None
-        frame_type, decoder = enabled[mode]
-        return decoder(frames.get_frame(frame_type))
+
+def _decode_orbbec_frame(frames, mode: str, enabled: dict[str, tuple[Any, Any]], logged_modes: set[str]):
+    if mode not in enabled:
+        return None
+    frame_type, decoder = enabled[mode]
+    frame = frames.get_frame(frame_type)
+    if frame is not None and mode not in logged_modes:
+        try:
+            video = frame.as_video_frame()
+            print(
+                json.dumps(
+                    {
+                        "type": "orbbec_frame",
+                        "mode": mode,
+                        "width": video.get_width(),
+                        "height": video.get_height(),
+                        "format": str(video.get_format()),
+                    }
+                ),
+                flush=True,
+            )
+        except Exception:
+            pass
+        logged_modes.add(mode)
+    return decoder(frame)
 
     def frame_payload(self, spec: CameraSpec) -> dict[str, Any]:
         with self.lock:
@@ -354,10 +496,6 @@ class OrbbecSdkFeed:
             captured_at = self.latest_t.get(spec.camera_id)
             error = self.errors.get(spec.camera_id) or self.errors.get(spec.value)
         return _jpeg_payload(spec.camera_id, f"orbbec:{spec.value}", jpeg, captured_at, error)
-
-    def close(self) -> None:
-        self.stop.set()
-
 
 class OrbbecLogicalFeed:
     def __init__(self, source: OrbbecSdkFeed, spec: CameraSpec):

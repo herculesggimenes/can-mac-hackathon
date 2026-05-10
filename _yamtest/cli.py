@@ -126,7 +126,6 @@ def _process_lines() -> list[str]:
         "debug/can-bridge",
         "start_bimanual_bridges.sh",
         "teleop_viewer.py",
-        "camera_http_server.py",
         "multi_camera_ws_server.py",
         "yam_control_ws_server.py",
         "yam_lerobot_policy_server.py",
@@ -188,9 +187,6 @@ def _start_background(name: str, cmd: list[str], *, env: dict[str, str] | None =
         print(f"{name} already running: pid={pid}")
         return int(pid)
     patterns = {
-        "camera": ["camera_http_server.py"],
-        # Avoid matching the main ``camera`` helper: discovery uses probe-only before start in cmd_hybrid.
-        "camera_left": [],
         "cameras": ["multi_camera_ws_server.py"],
         "bridge": ["slcan_bridge.py"],
         "control": ["yam_control_ws_server.py"],
@@ -282,7 +278,7 @@ def cmd_status(_args: argparse.Namespace) -> int:
         "can1_socket": CAN1_SOCKET.exists(),
         "pid_files": {
             name: {"pid": _read_pid(name), "running": _pid_running(_read_pid(name))}
-            for name in ("camera", "camera_left", "cameras", "bridge", "viewer", "control", "model", "policy")
+            for name in ("cameras", "bridge", "viewer", "control", "model", "policy")
         },
         "processes": _process_lines(),
     }
@@ -954,32 +950,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     can_check.set_defaults(func=cmd_can_check)
 
-    camera = sub.add_parser("camera", help="Start the local HTTP camera helper.")
-    camera.add_argument("--camera-index", default="0", help="OpenCV camera index, or 'auto' to probe indexes.")
-    camera.add_argument("--max-camera-index", type=int, default=9)
-    camera.add_argument("--host", default="127.0.0.1")
-    camera.add_argument("--port", type=int, default=8766)
-    camera.set_defaults(func=cmd_start_camera)
-
-    orbbec = sub.add_parser(
-        "orbbec-camera",
-        help=(
-            "Print the sudo command to start the Orbbec wrist HTTP frame server on macOS. "
-            "macOS UVC requires root for the SDK; the rest of the stack stays non-root."
-        ),
-    )
-    orbbec.add_argument("--host", default="127.0.0.1")
-    orbbec.add_argument("--port", type=int, default=8767)
-    orbbec.add_argument("--quality", type=int, default=85)
-    orbbec.add_argument("--max-fps", type=float, default=15.0)
-    orbbec.add_argument(
-        "--flip",
-        choices=["none", "vertical", "horizontal", "both"],
-        default="vertical",
-        help="Printed sudo line passes this to orbbec_camera_server.py (default: vertical).",
-    )
-    orbbec.set_defaults(func=cmd_orbbec_camera_hint)
-
     cameras = sub.add_parser("cameras", help="Start one WebSocket endpoint for multiple camera feeds.")
     cameras.add_argument(
         "--camera-specs",
@@ -996,15 +966,6 @@ def build_parser() -> argparse.ArgumentParser:
     cameras.add_argument("--height", type=int, default=360)
     cameras.add_argument("--quality", type=int, default=80)
     cameras.set_defaults(func=cmd_start_cameras)
-
-    snapshot = sub.add_parser("camera-snapshot", help="Capture one local camera frame to a JPEG.")
-    snapshot.add_argument("--camera-url", default=DEFAULT_CAMERA_URL)
-    snapshot.add_argument("--output", default="logs/latest-camera.jpg")
-    snapshot.add_argument("--timeout", type=float, default=5.0)
-    snapshot.add_argument("--camera-index", default="0")
-    snapshot.add_argument("--max-camera-index", type=int, default=9)
-    snapshot.add_argument("--ensure-camera", action="store_true", help="Start the camera helper before fetching.")
-    snapshot.set_defaults(func=cmd_camera_snapshot)
 
     bridge = sub.add_parser(
         "bridge",
@@ -1047,7 +1008,7 @@ def build_parser() -> argparse.ArgumentParser:
         "targets",
         nargs="*",
         default=["model", "viewer", "control", "policy", "cameras", "bridge"],
-        choices=["model", "viewer", "control", "policy", "bridge", "camera", "cameras"],
+        choices=["model", "viewer", "control", "policy", "bridge", "cameras"],
     )
     stop.add_argument("--hard-stop", action="store_true", help="Set HARD_STOP before stopping processes.")
     stop.set_defaults(func=cmd_stop)

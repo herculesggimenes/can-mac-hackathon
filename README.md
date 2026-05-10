@@ -101,21 +101,6 @@ The API still expects exactly two arms and 14D commands.
 
 ## Camera WebSocket
 
-Start the single-camera helper:
-
-```bash
-uv run yamctl camera \
-  --camera-index auto \
-  --host 0.0.0.0 \
-  --port 8766
-```
-
-HTTP JPEG endpoint:
-
-```text
-http://<robot-mac-ip>:8766/frame.jpg
-```
-
 Start the multi-camera WebSocket endpoint:
 
 ```bash
