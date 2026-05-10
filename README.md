@@ -1,7 +1,9 @@
 # YAM WebSocket Control
 
-This repo exposes the YAM robot and camera feeds through simple WebSocket APIs
-so external agents can control one or two arms without running the local viewer.
+This repo exposes a bimanual YAM robot and camera feeds through simple
+WebSocket APIs. The robot control server owns the bimanual CAN bridge process,
+so there is one process responsible for bridge startup, socket health, robot
+connection, and reconnect.
 
 ## Setup
 
@@ -13,7 +15,7 @@ uv sync
 
 ## Robot Control WebSocket
 
-Start the API server for one YAM arm:
+Start the bimanual API server:
 
 ```bash
 uv run yamctl stop viewer model --hard-stop
@@ -32,47 +34,39 @@ Quick smoke test:
 uv run python scripts/yam_ws_client.py --method get_joint_pos
 uv run python scripts/yam_ws_client.py \
   --method command_joint_pos \
-  --params '{"joint_pos":[0,0,0,0,0,0,0.3]}'
+  --params '{"joint_pos":[0,0,0,0,0,0,0.3,0,0,0,0,0,0,0.3]}'
 ```
 
 The API uses JSON-RPC-style messages with method names matching the YAM robot
-object:
+object. It is bimanual-only: joint position reads and writes are 14D vectors in
+`left[0:7] + right[0:7]` order.
 
 ```json
 {"id":"1","method":"get_joint_pos","params":{}}
-{"id":"2","method":"command_joint_pos","params":{"joint_pos":[0,0,0,0,0,0,0.3]}}
+{"id":"2","method":"command_joint_pos","params":{"joint_pos":[0,0,0,0,0,0,0.3,0,0,0,0,0,0,0.3]}}
 {"id":"3","method":"get_observations","params":{}}
 {"id":"4","method":"get_robot_info","params":{}}
 {"id":"5","method":"num_dofs","params":{}}
 {"id":"6","method":"zero_torque_mode","params":{}}
 {"id":"7","method":"get_status","params":{}}
-{"id":"8","method":"reconnect","params":{"arm":"left"}}
+{"id":"8","method":"reconnect","params":{}}
 ```
 
-Legacy command-style messages are also supported:
-
-```json
-{"type":"get_state"}
-{"type":"get_status"}
-{"type":"command_joints","q":[0,0,0,0,0,0,0.3]}
-{"type":"command_delta","dq":[0,0,0,0,0,0,0.02]}
-{"type":"subscribe_state","fps":10}
-{"type":"hard_stop"}
-```
-
-Joint commands are seven numbers. Joint 7 is the normalized gripper command and
-is clamped by default to `[0.01, 0.59]`.
+Joint commands are fourteen numbers. Each arm has seven joints. Joint 7 of each
+arm is the normalized gripper command and is clamped by default to `[0.01,
+0.59]`.
 
 ## Reconnect Behavior
 
-The server manages each arm independently:
+The server owns and supervises the bimanual bridge plus both arms:
 
-- If a CAN socket or robot call fails, only that arm is marked disconnected.
+- If the bridge exits or sockets disappear, the server restarts the bridge.
+- If a robot call fails, that arm is marked disconnected.
 - The WebSocket server keeps running.
-- `get_status` and `get_state` report `connected`, `last_error`,
+- `get_status` reports bridge state plus per-arm `connected`, `last_error`,
   `last_disconnected_at`, `next_reconnect_at`, and `reconnect_attempts`.
 - The server retries disconnected arms with exponential backoff.
-- Command calls fail fast while the target arm is disconnected.
+- Command calls fail fast if either arm is disconnected.
 - You can force reconnect with the `reconnect` method.
 
 Tune reconnect timing:
@@ -83,42 +77,27 @@ uv run yamctl control-server \
   --reconnect-max-delay 5.0
 ```
 
-## Two YAM Arms
+## Bridge And Arm Mapping
 
 Two stock YAM arms need separate CAN buses unless the motor ids are remapped,
 because each arm uses motor ids `1..7`.
 
-Start one bridge per adapter/socket:
+By default, `yamctl control-server` starts `can-bridge/start_bimanual_bridges.sh`
+inside the API server process and uses:
 
-```bash
-uv run python can-bridge/slcan_bridge.py \
-  --serial /dev/cu.LEFT_CANABLE \
-  --socket /tmp/can0.sock \
-  --bitrate 1000000
-
-uv run python can-bridge/slcan_bridge.py \
-  --serial /dev/cu.RIGHT_CANABLE \
-  --socket /tmp/can1.sock \
-  --bitrate 1000000
+```text
+left:can0,right:can1
 ```
 
-Then start the API with explicit arm ids:
+Override only if the physical mapping is different:
 
 ```bash
 uv run yamctl control-server \
-  --no-bridge \
-  --arm-specs left:can0,right:can1 \
+  --arm-specs left:can1,right:can0 \
   --host 0.0.0.0
 ```
 
-When multiple arms are connected, write commands must include the target arm:
-
-```json
-{"id":"left-open","method":"command_joint_pos","params":{"arm":"left","joint_pos":[0,0,0,0,0,0,0.59]}}
-{"id":"right-state","method":"get_joint_pos","params":{"arm":"right"}}
-```
-
-Read-only calls without `arm` return a map for every connected arm.
+The API still expects exactly two arms and 14D commands.
 
 ## Camera WebSocket
 

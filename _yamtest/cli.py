@@ -243,6 +243,15 @@ def _wait_for_socket(timeout_s: float = 5.0) -> bool:
     return CAN_SOCKET.exists()
 
 
+def _wait_for_bimanual_sockets(timeout_s: float = 8.0) -> bool:
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if CAN_SOCKET.exists() and CAN1_SOCKET.exists():
+            return True
+        time.sleep(0.1)
+    return CAN_SOCKET.exists() and CAN1_SOCKET.exists()
+
+
 def _compose_task(task: str, context: str | None, context_file: str | None) -> str:
     parts = [task.strip()]
     if context_file:
@@ -520,17 +529,6 @@ def cmd_start_viewer(args: argparse.Namespace) -> int:
 def cmd_start_control_server(args: argparse.Namespace) -> int:
     if not _ensure_no_robot_owner(allow=args.allow_concurrent_owner):
         return 1
-    if args.arm_specs and args.arm_specs != f"{args.arm_id}:can0":
-        print(
-            "multi-arm control expects one SLCAN bridge per arm channel, for example "
-            "`slcan_bridge.py --serial /dev/cu.LEFT --socket /tmp/can0.sock` and "
-            "`slcan_bridge.py --serial /dev/cu.RIGHT --socket /tmp/can1.sock`.",
-            file=sys.stderr,
-        )
-    elif not args.no_bridge:
-        bridge_args = argparse.Namespace(serial_port=args.serial_port, bitrate=args.bitrate)
-        if cmd_start_bridge(bridge_args) != 0:
-            return 1
     cmd = [
         _python(),
         "scripts/yam_control_ws_server.py",
@@ -538,10 +536,8 @@ def cmd_start_control_server(args: argparse.Namespace) -> int:
         args.host,
         "--port",
         str(args.port),
-        "--arm-id",
-        args.arm_id,
-        "--channel",
-        args.channel,
+        "--arm-specs",
+        args.arm_specs,
         "--min-gripper",
         str(args.min_gripper),
         "--max-gripper",
@@ -550,9 +546,9 @@ def cmd_start_control_server(args: argparse.Namespace) -> int:
         str(args.reconnect_initial_delay),
         "--reconnect-max-delay",
         str(args.reconnect_max_delay),
+        "--bridge-startup-timeout",
+        str(args.bridge_startup_timeout),
     ]
-    if args.arm_specs:
-        cmd.extend(["--arm-specs", args.arm_specs])
     if args.background:
         _start_background("control", cmd)
         return 0
@@ -1034,18 +1030,14 @@ def build_parser() -> argparse.ArgumentParser:
     viewer.set_defaults(func=cmd_start_viewer)
 
     control = sub.add_parser("control-server", help="Start the simple YAM WebSocket control server.")
-    control.add_argument("--serial-port", default=DEFAULT_SERIAL_PORT)
-    control.add_argument("--bitrate", type=int, default=1_000_000)
     control.add_argument("--host", default="127.0.0.1")
     control.add_argument("--port", type=int, default=8780)
-    control.add_argument("--arm-id", default="left")
-    control.add_argument("--channel", default="can0")
-    control.add_argument("--arm-specs", help="Comma-separated arm_id:channel list, e.g. left:can0,right:can1.")
+    control.add_argument("--arm-specs", default="left:can0,right:can1", help="Comma-separated arm_id:channel list. Must contain exactly two arms.")
     control.add_argument("--min-gripper", type=float, default=0.01)
     control.add_argument("--max-gripper", type=float, default=0.59)
     control.add_argument("--reconnect-initial-delay", type=float, default=0.5)
     control.add_argument("--reconnect-max-delay", type=float, default=5.0)
-    control.add_argument("--no-bridge", action="store_true", help="Do not auto-start the single /tmp/can0.sock bridge.")
+    control.add_argument("--bridge-startup-timeout", type=float, default=10.0)
     control.add_argument("--background", action="store_true")
     control.add_argument("--allow-concurrent-owner", action="store_true", help="Bypass the single robot-owner guard.")
     control.set_defaults(func=cmd_start_control_server)
