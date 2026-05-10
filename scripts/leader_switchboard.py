@@ -10,6 +10,7 @@ import os
 import signal
 import subprocess
 import time
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -40,7 +41,7 @@ class TeleopStart(BaseModel):
     sixth_joint_source: str = "gripper"
     sixth_joint_sign: float = -1.0
     lock_joints: str = ""
-    hz: float = 60.0
+    hz: float = 30.0
     max_step: float = 0.015
     max_gripper_step: float = 0.01
     max_joint_delta: float = 0.25
@@ -87,6 +88,7 @@ class Runtime:
 
 
 runtime = Runtime()
+runtime_lock = threading.Lock()
 
 
 def _detect_leader_port() -> str:
@@ -138,10 +140,12 @@ def create_app(camera_url: str) -> FastAPI:
         if config.sixth_joint_source not in {"none", "gripper", "wrist_roll"}:
             raise HTTPException(status_code=400, detail="invalid sixth_joint_source")
 
-        runtime.stop()
-        if config.leader_port == DEFAULT_LEADER_PORT and not Path(config.leader_port).exists():
-            config.leader_port = _detect_leader_port()
-        cmd = [
+        with runtime_lock:
+            runtime.stop()
+            time.sleep(0.25)
+            if config.leader_port == DEFAULT_LEADER_PORT and not Path(config.leader_port).exists():
+                config.leader_port = _detect_leader_port()
+            cmd = [
             str(LEROBOT / ".venv" / "bin" / "python"),
             str(LEADER_BRIDGE),
             "--control-url",
@@ -172,34 +176,41 @@ def create_app(camera_url: str) -> FastAPI:
             "--fire-and-forget",
             "--execute",
         ]
-        env = os.environ.copy()
-        env["PYTHONPATH"] = "src"
-        LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        log = LOG_PATH.open("a")
-        log.write(f"\n--- {time.strftime('%Y-%m-%d %H:%M:%S')} starting {' '.join(cmd)} ---\n")
-        log.flush()
-        proc = subprocess.Popen(
-            cmd,
-            cwd=LEROBOT,
-            env=env,
-            text=True,
-            stdout=log,
-            stderr=log,
-            start_new_session=True,
-        )
-        runtime.proc = proc
-        runtime.started_at = time.time()
-        runtime.config = config.model_dump()
-        time.sleep(0.4)
-        if proc.poll() is not None:
-            runtime.stop()
-            raise HTTPException(status_code=500, detail="leader bridge exited during startup")
-        return runtime.status()
+            env = os.environ.copy()
+            env["PYTHONPATH"] = "src"
+            LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            log = LOG_PATH.open("a")
+            log.write(f"\n--- {time.strftime('%Y-%m-%d %H:%M:%S')} starting {' '.join(cmd)} ---\n")
+            log.flush()
+            proc = subprocess.Popen(
+                cmd,
+                cwd=LEROBOT,
+                env=env,
+                text=True,
+                stdout=log,
+                stderr=log,
+                start_new_session=True,
+            )
+            runtime.proc = proc
+            runtime.started_at = time.time()
+            runtime.config = config.model_dump()
+            time.sleep(1.2)
+            if proc.poll() is not None:
+                runtime.stop()
+                detail = "leader bridge exited during startup"
+                try:
+                    tail = LOG_PATH.read_text(errors="replace").splitlines()[-25:]
+                    detail = detail + "\n" + "\n".join(tail)
+                except Exception:
+                    pass
+                raise HTTPException(status_code=500, detail=detail)
+            return runtime.status()
 
     @app.post("/api/teleop/stop")
     def teleop_stop() -> dict[str, Any]:
-        runtime.stop()
-        return runtime.status()
+        with runtime_lock:
+            runtime.stop()
+            return runtime.status()
 
     @app.get("/api/robot/status")
     async def robot_status(control_url: str = DEFAULT_CONTROL_URL) -> dict[str, Any]:
@@ -293,7 +304,7 @@ INDEX_HTML = r"""<!doctype html>
           <div><label>Sixth source</label><select id="sixthSource"><option>gripper</option><option>wrist_roll</option><option>none</option></select></div>
         </div>
         <div class="row">
-          <div><label>Hz</label><input id="hz" type="number" min="1" max="120" step="1" value="60"></div>
+          <div><label>Hz</label><input id="hz" type="number" min="1" max="120" step="1" value="30"></div>
           <div><label>Max step</label><input id="maxStep" type="number" min="0.001" max="0.1" step="0.001" value="0.015"></div>
         </div>
         <label>Lock YAM arm joints</label>
@@ -347,6 +358,7 @@ function lockJoints() {
   return [...document.querySelectorAll("#locks input:checked")].map(i => i.value).join(",");
 }
 $("startBtn").onclick = async () => {
+  $("startBtn").disabled = true;
   const payload = {
     arm: activeArm,
     control_url: $("controlUrl").value,
@@ -354,12 +366,16 @@ $("startBtn").onclick = async () => {
     joint_signs: $("jointSigns").value,
     sixth_joint_source: $("sixthSource").value,
     lock_joints: lockJoints(),
-    hz: Number($("hz").value || 60),
+    hz: Number($("hz").value || 30),
     max_step: Number($("maxStep").value || 0.015)
   };
-  const res = await fetch("/api/teleop/start", {method:"POST", headers:{"content-type":"application/json"}, body:JSON.stringify(payload)});
-  if (!res.ok) alert(await res.text());
-  await refresh();
+  try {
+    const res = await fetch("/api/teleop/start", {method:"POST", headers:{"content-type":"application/json"}, body:JSON.stringify(payload)});
+    if (!res.ok) alert(await res.text());
+    await refresh();
+  } finally {
+    $("startBtn").disabled = false;
+  }
 };
 $("stopBtn").onclick = async () => { await fetch("/api/teleop/stop", {method:"POST"}); await refresh(); };
 $("zeroOnBtn").onclick = () => setZeroGravity(true);

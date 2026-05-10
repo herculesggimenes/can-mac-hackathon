@@ -180,7 +180,12 @@ def main() -> int:
 
     leader = SOLoader(args.port, args.kind)
     try:
-        with connect(args.control_url, max_size=16 * 1024 * 1024) as ws:
+        with connect(
+            args.control_url,
+            open_timeout=15,
+            max_size=16 * 1024 * 1024,
+            ping_interval=None,
+        ) as ws:
             # Synchronization point: sample both live robot and leader after the
             # previous bridge has fully stopped, then treat that pair as zero
             # relative motion. This prevents a startup jump from stale offsets.
