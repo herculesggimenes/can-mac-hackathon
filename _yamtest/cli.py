@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import os
 import signal
@@ -13,15 +14,26 @@ import time
 import urllib.request
 from pathlib import Path
 
+from PIL import Image
+
 
 ROOT = Path(__file__).resolve().parents[1]
+_SCRIPTS = ROOT / "scripts"
+if str(_SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS))
+from http_camera_fetch import build_urllib_camera_request, fetch_rgb_from_camera_url  # noqa: E402
+
 LOG_DIR = ROOT / "logs"
 STOP_FILE = ROOT / "HARD_STOP"
 CAN_SOCKET = Path("/tmp/can0.sock")
 CAN1_SOCKET = Path("/tmp/can1.sock")
 
 DEFAULT_SERIAL_PORT = os.environ.get("YAM_SERIAL_PORT", "/dev/cu.usbmodem206D338A594E1")
-DEFAULT_CAMERA_URL = os.environ.get("YAM_CAMERA_URL", "http://127.0.0.1:8766/frame.jpg")
+DEFAULT_CAMERA_URL = (
+    os.environ.get("YAM_CAMERA_URL")
+    or os.environ.get("YAM_FRONT_CAMERA_URL")
+    or "http://127.0.0.1:8766/frame.jpg"
+)
 DEFAULT_ONE_ARM_POLICY_HTTP_URL = os.environ.get("YAM_ONE_ARM_POLICY_HTTP_URL", "http://127.0.0.1:8777/infer")
 # Default Modal Molmo HTTP `/infer` when YAM_MODAL_POLICY_HTTP_URL is unset (override per deployment).
 _DEFAULT_MODAL_INFER_URL = "https://aacmcgovern--yam-molmoact2-http-bridge-v3-serve.modal.run/infer"
@@ -311,7 +323,8 @@ def _http_jpeg_ready(url: str, *, timeout_s: float = 0.75) -> bool:
     """True if ``url`` returns HTTP 200 with a body (JPEG helper is warm)."""
 
     try:
-        with urllib.request.urlopen(url, timeout=timeout_s) as response:
+        req = build_urllib_camera_request(url)
+        with urllib.request.urlopen(req, timeout=timeout_s) as response:
             return int(getattr(response, "status", 200) or 200) == 200 and len(response.read(4096)) > 100
     except OSError:
         return False
@@ -390,17 +403,24 @@ def cmd_camera_snapshot(args: argparse.Namespace) -> int:
 
     deadline = time.time() + args.timeout
     last_error: Exception | None = None
+    cam_url = args.camera_url.strip()
     while time.time() < deadline:
         try:
-            with urllib.request.urlopen(args.camera_url, timeout=1.0) as response:
-                body = response.read()
+            if cam_url.startswith(("ws://", "wss://")):
+                rgb = fetch_rgb_from_camera_url(cam_url, timeout=min(5.0, max(0.5, deadline - time.time())))
+                buf = io.BytesIO()
+                Image.fromarray(rgb).save(buf, format="JPEG", quality=88)
+                body = buf.getvalue()
+            else:
+                with urllib.request.urlopen(build_urllib_camera_request(cam_url), timeout=1.0) as response:
+                    body = response.read()
             output.write_bytes(body)
-            print(json.dumps({"camera_url": args.camera_url, "output": str(output), "bytes": len(body)}))
+            print(json.dumps({"camera_url": cam_url, "output": str(output), "bytes": len(body)}))
             return 0
         except Exception as exc:  # noqa: BLE001 - report final camera fetch failure.
             last_error = exc
             time.sleep(0.2)
-    print(f"camera snapshot failed from {args.camera_url}: {last_error}", file=sys.stderr)
+    print(f"camera snapshot failed from {cam_url}: {last_error}", file=sys.stderr)
     return 1
 
 
@@ -1074,7 +1094,8 @@ def build_parser() -> argparse.ArgumentParser:
     hybrid.add_argument(
         "--camera-url",
         default=DEFAULT_CAMERA_URL,
-        help="HTTP JPEG for Molmo 'top' (overhead) when --top-camera-index is omitted (often port 8766).",
+        help="Molmo 'top' when --top-camera-index omitted: HTTP(S) JPEG or ws/wss camera stream. "
+        "Set YAM_CAMERA_URL or YAM_FRONT_CAMERA_URL for a default. Molmo also has left (--left-camera-url) and wrist right.",
     )
     hybrid.add_argument(
         "--right-orbbec",
@@ -1090,7 +1111,7 @@ def build_parser() -> argparse.ArgumentParser:
     hybrid.add_argument(
         "--right-camera-url",
         default=None,
-        help="HTTP URL for wrist JPEG (Molmo 'right'). Mutually exclusive with --right-orbbec / --right-camera-index.",
+        help="HTTP or ws/wss URL for wrist (Molmo 'right'). Mutually exclusive with --right-orbbec / --right-camera-index.",
     )
     hybrid.add_argument(
         "--camera-index",
@@ -1119,8 +1140,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     hybrid.add_argument(
         "--left-camera-url",
-        default=None,
-        help="HTTP URL for Molmo 'left' JPEG (omit with --left-camera-index for OpenCV).",
+        default=os.environ.get("YAM_LEFT_CAMERA_URL"),
+        help="HTTP or ws/wss URL for Molmo 'left' (omit with --left-camera-index for OpenCV). "
+        "Default: YAM_LEFT_CAMERA_URL.",
     )
     hybrid.add_argument(
         "--ensure-left-camera",
@@ -1157,7 +1179,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="JPEG quality for policy images (lower = smaller uploads to Modal).",
     )
     hybrid.add_argument("--http-timeout", type=float, default=300.0)
-    hybrid.add_argument("--max-iterations", type=int, default=100)
+    hybrid.add_argument("--max-iterations", type=int, default=300)
     hybrid.add_argument("--max-temp-mos", type=float, default=55.0)
     hybrid.add_argument("--max-temp-rotor", type=float, default=100.0)
     hybrid.add_argument("--min-gripper-command", type=float, default=0.01)

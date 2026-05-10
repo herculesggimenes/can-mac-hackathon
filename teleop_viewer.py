@@ -18,7 +18,10 @@ import mujoco
 import numpy as np
 import viser
 
-sys.path.insert(0, str(Path(__file__).resolve().parent / "can-bridge"))
+_repo_root = Path(__file__).resolve().parent
+sys.path.insert(0, str(_repo_root / "can-bridge"))
+sys.path.insert(0, str(_repo_root / "scripts"))
+from http_camera_fetch import build_urllib_camera_request  # noqa: E402
 from can_bridge import CanBridgeBus
 from mjviser import ViserMujocoScene
 
@@ -179,7 +182,7 @@ class EpisodeRecorder:
         if image_path is None:
             return None
         try:
-            with urllib.request.urlopen(self.camera_url, timeout=0.5) as response:
+            with urllib.request.urlopen(build_urllib_camera_request(self.camera_url), timeout=0.5) as response:
                 body = response.read()
             image_path.write_bytes(body)
             return image_rel.as_posix()

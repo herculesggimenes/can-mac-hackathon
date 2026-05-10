@@ -39,6 +39,7 @@ from local_modal_robot_bridge import (  # noqa: E402
     _safety_report,
     _safety_report_pair,
 )
+from http_camera_fetch import fetch_rgb_from_camera_url  # noqa: E402
 from opencv_util import video_capture  # noqa: E402
 from orbbec_wrist import OrbbecColorPipeline  # noqa: E402
 
@@ -81,10 +82,13 @@ class Trace:
         self._file.close()
 
 
-def _fetch_rgb(camera_url: str) -> np.ndarray:
-    response = requests.get(camera_url, timeout=5)
-    response.raise_for_status()
-    return np.asarray(Image.open(io.BytesIO(response.content)).convert("RGB"))
+def _fetch_rgb(args: argparse.Namespace, camera_url: str) -> np.ndarray:
+    return fetch_rgb_from_camera_url(
+        camera_url.strip(),
+        timeout=5.0,
+        session=getattr(args, "_http_session", None),
+        ws_registry=getattr(args, "_camera_ws_registry", None),
+    )
 
 
 def _resize_rgb_to_shape(rgb: np.ndarray, target_hw: tuple[int, int]) -> np.ndarray:
@@ -113,7 +117,7 @@ def _raw_wrist_rgb(
         return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
     ru = getattr(args, "right_camera_url", None) or ""
     if ru.strip():
-        return _fetch_rgb(ru.strip())
+        return _fetch_rgb(args, ru)
     raise RuntimeError(
         "Molmo 'right' needs exactly one wrist source: --right-orbbec | --right-camera-index | --right-camera-url. "
         "--camera-url is only for overhead/top (HTTP)."
@@ -138,7 +142,7 @@ def _top_rgb_for_policy(
             trace.write("top_camera_read_failed", iteration=iteration, error=str(exc))
             return black
     try:
-        raw_top = _fetch_rgb(args.camera_url)
+        raw_top = _fetch_rgb(args, args.camera_url)
         return _resize_rgb_to_shape(raw_top, hw)
     except Exception as exc:  # noqa: BLE001
         trace.write("top_camera_http_failed", iteration=iteration, error=repr(exc))
@@ -165,7 +169,7 @@ def _left_rgb_for_policy(
     lu = getattr(args, "left_camera_url", None) or ""
     if lu.strip():
         try:
-            raw_left = _fetch_rgb(lu.strip())
+            raw_left = _fetch_rgb(args, lu)
             return _resize_rgb_to_shape(raw_left, hw)
         except Exception as exc:  # noqa: BLE001
             trace.write("left_camera_http_failed", iteration=iteration, error=repr(exc))
@@ -459,6 +463,7 @@ def run(args: argparse.Namespace) -> int:
     if not trace_root.is_absolute():
         trace_root = ROOT / trace_root
     trace = Trace(trace_root)
+    args._camera_ws_registry = {}
     _ws = sum(
         [
             bool(getattr(args, "right_orbbec", False)),
@@ -471,8 +476,8 @@ def run(args: argparse.Namespace) -> int:
             "hybrid: specify exactly one wrist source for Molmo right:\n"
             "  --right-orbbec           Orbbec color stream\n"
             "  --right-camera-index N   USB webcam (OpenCV)\n"
-            "  --right-camera-url URL   wrist JPEG over HTTP\n"
-            "(--camera-url is overhead/top HTTP only, not the wrist.)",
+            "  --right-camera-url URL   wrist JPEG over HTTP or WebSocket (ws/wss)\n"
+            "(--camera-url is Molmo top HTTP/WebSocket only, not the wrist.)",
             file=sys.stderr,
         )
         trace.close()
@@ -487,7 +492,7 @@ def run(args: argparse.Namespace) -> int:
         print(
             "hybrid: use at most one Molmo left source:\n"
             "  --left-camera-index N   OpenCV device\n"
-            "  --left-camera-url URL   JPEG over HTTP\n",
+            "  --left-camera-url URL   JPEG over HTTP or WebSocket (ws/wss)\n",
             file=sys.stderr,
         )
         trace.close()
@@ -804,8 +809,8 @@ def main() -> int:
     parser.add_argument(
         "--camera-url",
         default="http://127.0.0.1:8766/frame.jpg",
-        help="HTTP JPEG for Molmo 'top' (overhead) when --top-camera-index is omitted. "
-        "Wrist/right must come from --right-orbbec, --right-camera-index, or --right-camera-url.",
+        help="Molmo 'top' when --top-camera-index omitted: HTTP(S) JPEG URL or ws/wss WebSocket sending JPEG/PNG "
+        "binary or JSON base64 frames. Wrist/right: --right-orbbec, --right-camera-index, or --right-camera-url.",
     )
     parser.add_argument(
         "--right-orbbec",
@@ -821,7 +826,8 @@ def main() -> int:
     parser.add_argument(
         "--right-camera-url",
         default=None,
-        help="HTTP JPEG URL for wrist (Molmo 'right'). Mutually exclusive with --right-orbbec / --right-camera-index.",
+        help="HTTP JPEG or ws/wss WebSocket URL for wrist (Molmo 'right'). Mutually exclusive with "
+        "--right-orbbec / --right-camera-index.",
     )
     parser.add_argument(
         "--top-camera-index",
@@ -838,7 +844,7 @@ def main() -> int:
     parser.add_argument(
         "--left-camera-url",
         default=None,
-        help="HTTP JPEG URL for Molmo 'left'. Mutually exclusive with --left-camera-index. If both omitted, left is black.",
+        help="HTTP or ws/wss URL for Molmo 'left'. Mutually exclusive with --left-camera-index. If both omitted, left is black.",
     )
     parser.add_argument("--trace-dir", default="logs/hybrid-latest")
     parser.add_argument("--hz", type=float, default=60.0)
@@ -855,7 +861,7 @@ def main() -> int:
         help="JPEG quality for images sent to Modal (lower = smaller JSON + less upload time; 70–85 typical).",
     )
     parser.add_argument("--http-timeout", type=float, default=300.0)
-    parser.add_argument("--max-iterations", type=int, default=100)
+    parser.add_argument("--max-iterations", type=int, default=300)
     parser.add_argument("--max-temp-mos", type=float, default=55.0)
     parser.add_argument("--max-temp-rotor", type=float, default=100.0)
     parser.add_argument("--min-gripper-command", type=float, default=0.01)

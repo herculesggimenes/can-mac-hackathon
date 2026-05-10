@@ -28,6 +28,8 @@ from PIL import Image
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 sys.path.insert(0, str(ROOT / "can-bridge"))
+
+from http_camera_fetch import fetch_rgb_from_camera_url  # noqa: E402
 STOP_FILE = ROOT / "HARD_STOP"
 STOP_REQUESTED = False
 
@@ -172,10 +174,7 @@ class OpenCVCamera:
 
 
 def _rgb_from_camera_url(url: str) -> np.ndarray:
-    response = requests.get(url, timeout=5)
-    response.raise_for_status()
-    image = Image.open(io.BytesIO(response.content)).convert("RGB")
-    return np.asarray(image)
+    return fetch_rgb_from_camera_url(url, timeout=5.0)
 
 
 def _apply_right_camera_flip(rgb: np.ndarray, mode: str | None) -> np.ndarray:
