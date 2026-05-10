@@ -41,11 +41,13 @@ class TeleopStart(BaseModel):
     sixth_joint_source: str = "gripper"
     sixth_joint_sign: float = -1.0
     lock_joints: str = ""
-    hz: float = 30.0
-    max_step: float = 0.015
-    max_gripper_step: float = 0.01
-    max_joint_delta: float = 0.25
+    hz: float = 20.0
+    max_step: float = 0.006
+    max_gripper_step: float = 0.005
+    max_joint_delta: float = 0.15
     sync_samples: int = 5
+    fire_and_forget: bool = True
+    max_in_flight: int = 2
 
 
 class ZeroGravityRequest(BaseModel):
@@ -146,36 +148,39 @@ def create_app(camera_url: str) -> FastAPI:
             if config.leader_port == DEFAULT_LEADER_PORT and not Path(config.leader_port).exists():
                 config.leader_port = _detect_leader_port()
             cmd = [
-            str(LEROBOT / ".venv" / "bin" / "python"),
-            str(LEADER_BRIDGE),
-            "--control-url",
-            config.control_url,
-            "--port",
-            config.leader_port,
-            "--kind",
-            config.kind,
-            "--arm",
-            config.arm,
-            "--hz",
-            str(config.hz),
-            "--max-step",
-            str(config.max_step),
-            "--max-gripper-step",
-            str(config.max_gripper_step),
-            "--max-joint-delta",
-            str(config.max_joint_delta),
-            f"--joint-signs={config.joint_signs}",
-            "--sixth-joint-source",
-            config.sixth_joint_source,
-            "--sixth-joint-sign",
-            str(config.sixth_joint_sign),
-            "--lock-joints",
-            config.lock_joints,
-            "--sync-samples",
-            str(config.sync_samples),
-            "--fire-and-forget",
-            "--execute",
-        ]
+                str(LEROBOT / ".venv" / "bin" / "python"),
+                str(LEADER_BRIDGE),
+                "--control-url",
+                config.control_url,
+                "--port",
+                config.leader_port,
+                "--kind",
+                config.kind,
+                "--arm",
+                config.arm,
+                "--hz",
+                str(config.hz),
+                "--max-step",
+                str(config.max_step),
+                "--max-gripper-step",
+                str(config.max_gripper_step),
+                "--max-joint-delta",
+                str(config.max_joint_delta),
+                f"--joint-signs={config.joint_signs}",
+                "--sixth-joint-source",
+                config.sixth_joint_source,
+                "--sixth-joint-sign",
+                str(config.sixth_joint_sign),
+                "--lock-joints",
+                config.lock_joints,
+                "--sync-samples",
+                str(config.sync_samples),
+                "--max-in-flight",
+                str(config.max_in_flight),
+                "--execute",
+            ]
+            if config.fire_and_forget:
+                cmd.insert(-1, "--fire-and-forget")
             env = os.environ.copy()
             env["PYTHONPATH"] = "src"
             LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -304,8 +309,11 @@ INDEX_HTML = r"""<!doctype html>
           <div><label>Sixth source</label><select id="sixthSource"><option>gripper</option><option>wrist_roll</option><option>none</option></select></div>
         </div>
         <div class="row">
-          <div><label>Hz</label><input id="hz" type="number" min="1" max="120" step="1" value="30"></div>
-          <div><label>Max step</label><input id="maxStep" type="number" min="0.001" max="0.1" step="0.001" value="0.015"></div>
+          <div><label>Hz</label><input id="hz" type="number" min="1" max="120" step="1" value="20"></div>
+          <div><label>Max step</label><input id="maxStep" type="number" min="0.001" max="0.1" step="0.001" value="0.006"></div>
+        </div>
+        <div class="locks" style="grid-template-columns:1fr">
+          <label><input id="fireForget" type="checkbox" checked> Responsive bounded sends</label>
         </div>
         <label>Lock YAM arm joints</label>
         <div class="locks" id="locks"></div>
@@ -366,8 +374,10 @@ $("startBtn").onclick = async () => {
     joint_signs: $("jointSigns").value,
     sixth_joint_source: $("sixthSource").value,
     lock_joints: lockJoints(),
-    hz: Number($("hz").value || 30),
-    max_step: Number($("maxStep").value || 0.015)
+    hz: Number($("hz").value || 20),
+    max_step: Number($("maxStep").value || 0.006),
+    fire_and_forget: $("fireForget").checked,
+    max_in_flight: 2
   };
   try {
     const res = await fetch("/api/teleop/start", {method:"POST", headers:{"content-type":"application/json"}, body:JSON.stringify(payload)});

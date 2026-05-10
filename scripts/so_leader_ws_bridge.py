@@ -75,6 +75,20 @@ def _rpc(ws: Any, method: str, params: dict[str, Any] | None = None, *, wait: bo
         return response.get("result")
 
 
+def _drain_rpc_responses(ws: Any) -> int:
+    drained = 0
+    while True:
+        try:
+            response = json.loads(ws.recv(timeout=0))
+        except TimeoutError:
+            return drained
+        if response.get("type") == "hello":
+            continue
+        drained += 1
+        if not response.get("ok", True):
+            print(f"websocket command error: {response.get('error', response)}", file=sys.stderr, flush=True)
+
+
 class SOLoader:
     def __init__(self, port: str, kind: str):
         _install_torch_stub()
@@ -167,8 +181,9 @@ def main() -> int:
     parser.add_argument(
         "--fire-and-forget",
         action="store_true",
-        help="Do not wait for command_joint_pos responses in the control loop.",
+        help="Do not block on every command_joint_pos response. Responses are still drained to keep the socket healthy.",
     )
+    parser.add_argument("--max-in-flight", type=int, default=2, help="Maximum unacknowledged commands in no-wait mode.")
     parser.add_argument("--execute", action="store_true", help="Actually send WebSocket commands. Default is dry-run.")
     args = parser.parse_args()
 
@@ -209,8 +224,11 @@ def main() -> int:
             )
 
             dt = 1.0 / max(args.hz, 1.0)
+            in_flight = 0
             while True:
                 start = time.monotonic()
+                if args.fire_and_forget:
+                    in_flight = max(0, in_flight - _drain_rpc_responses(ws))
                 raw = leader.read_raw()
                 delta_raw = raw[:5] - leader_base[:5]
                 q14 = q14_base.copy()
@@ -254,7 +272,12 @@ def main() -> int:
                     )
                     q14[ARM_SLICES[arm_name]] = command_arms[arm_name]
                 if args.execute:
-                    _rpc(ws, "command_joint_pos", {"joint_pos": q14.tolist()}, wait=not args.fire_and_forget)
+                    if args.fire_and_forget:
+                        if in_flight < max(args.max_in_flight, 1):
+                            _rpc(ws, "command_joint_pos", {"joint_pos": q14.tolist()}, wait=False)
+                            in_flight += 1
+                    else:
+                        _rpc(ws, "command_joint_pos", {"joint_pos": q14.tolist()})
                 else:
                     print(json.dumps({"raw": raw.tolist(), "target": q14.tolist()}), flush=True)
 
