@@ -41,13 +41,13 @@ class TeleopStart(BaseModel):
     sixth_joint_source: str = "gripper"
     sixth_joint_sign: float = -1.0
     lock_joints: str = ""
-    hz: float = 20.0
+    hz: float = 40.0
     max_step: float = 0.006
     max_gripper_step: float = 0.005
     max_joint_delta: float = 0.15
     sync_samples: int = 5
     fire_and_forget: bool = True
-    max_in_flight: int = 2
+    max_in_flight: int = 3
 
 
 class ZeroGravityRequest(BaseModel):
@@ -309,7 +309,7 @@ INDEX_HTML = r"""<!doctype html>
           <div><label>Sixth source</label><select id="sixthSource"><option>gripper</option><option>wrist_roll</option><option>none</option></select></div>
         </div>
         <div class="row">
-          <div><label>Hz</label><input id="hz" type="number" min="1" max="120" step="1" value="20"></div>
+          <div><label>Hz</label><input id="hz" type="number" min="1" max="120" step="1" value="40"></div>
           <div><label>Max step</label><input id="maxStep" type="number" min="0.001" max="0.1" step="0.001" value="0.006"></div>
         </div>
         <div class="locks" style="grid-template-columns:1fr">
@@ -374,10 +374,10 @@ $("startBtn").onclick = async () => {
     joint_signs: $("jointSigns").value,
     sixth_joint_source: $("sixthSource").value,
     lock_joints: lockJoints(),
-    hz: Number($("hz").value || 20),
+    hz: Number($("hz").value || 40),
     max_step: Number($("maxStep").value || 0.006),
     fire_and_forget: $("fireForget").checked,
-    max_in_flight: 2
+    max_in_flight: 3
   };
   try {
     const res = await fetch("/api/teleop/start", {method:"POST", headers:{"content-type":"application/json"}, body:JSON.stringify(payload)});
@@ -412,7 +412,7 @@ function connectCamera() {
   if (cameraWs) cameraWs.close();
   const url = $("cameraUrl").value;
   cameraWs = new WebSocket(url);
-  cameraWs.onopen = () => cameraWs.send(JSON.stringify({type:"subscribe", fps:3, cameras:"all", bundle:true}));
+  cameraWs.onopen = () => cameraWs.send(JSON.stringify({type:"subscribe", fps:6, cameras:"all", bundle:true}));
   cameraWs.onmessage = (ev) => {
     const msg = JSON.parse(ev.data);
     if (msg.type === "hello" && Array.isArray(msg.cameras)) {
@@ -448,7 +448,7 @@ function ensureCam(cameraId, message) {
   return node;
 }
 $("cameraUrl").addEventListener("change", connectCamera);
-setInterval(refresh, 2000);
+setInterval(refresh, 1000);
 init();
 </script>
 </body>
