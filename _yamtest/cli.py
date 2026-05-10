@@ -213,6 +213,8 @@ def cmd_start_camera(args: argparse.Namespace) -> int:
         "scripts/camera_http_server.py",
         "--camera-index",
         str(args.camera_index),
+        "--max-camera-index",
+        str(args.max_camera_index),
         "--host",
         args.host,
         "--port",
@@ -224,7 +226,7 @@ def cmd_start_camera(args: argparse.Namespace) -> int:
 
 def cmd_camera_snapshot(args: argparse.Namespace) -> int:
     if args.ensure_camera:
-        camera_args = argparse.Namespace(camera_index=args.camera_index, host="127.0.0.1", port=8766)
+        camera_args = argparse.Namespace(camera_index=args.camera_index, max_camera_index=args.max_camera_index, host="127.0.0.1", port=8766)
         cmd_start_camera(camera_args)
 
     output = Path(args.output).expanduser()
@@ -334,7 +336,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         args.command_dt = args.command_dt if args.command_dt != 0.0 else 0.25
 
     if args.ensure_camera:
-        camera_args = argparse.Namespace(camera_index=args.camera_index, host="127.0.0.1", port=8766)
+        camera_args = argparse.Namespace(camera_index=args.camera_index, max_camera_index=args.max_camera_index, host="127.0.0.1", port=8766)
         cmd_start_camera(camera_args)
     bridge_args = argparse.Namespace(serial_port=args.serial_port, bitrate=args.bitrate)
     if cmd_start_bridge(bridge_args) != 0:
@@ -430,7 +432,7 @@ def cmd_hybrid(args: argparse.Namespace) -> int:
     if not _ensure_no_robot_owner(allow=args.allow_concurrent_owner):
         return 3
     if args.ensure_camera:
-        camera_args = argparse.Namespace(camera_index=args.camera_index, host="127.0.0.1", port=8766)
+        camera_args = argparse.Namespace(camera_index=args.camera_index, max_camera_index=args.max_camera_index, host="127.0.0.1", port=8766)
         cmd_start_camera(camera_args)
     bridge_args = argparse.Namespace(serial_port=args.serial_port, bitrate=args.bitrate)
     if cmd_start_bridge(bridge_args) != 0:
@@ -542,7 +544,8 @@ def build_parser() -> argparse.ArgumentParser:
     clear_stop.set_defaults(func=cmd_clear_stop)
 
     camera = sub.add_parser("camera", help="Start the local HTTP camera helper.")
-    camera.add_argument("--camera-index", type=int, default=0)
+    camera.add_argument("--camera-index", default="0", help="OpenCV camera index, or 'auto' to probe indexes.")
+    camera.add_argument("--max-camera-index", type=int, default=9)
     camera.add_argument("--host", default="127.0.0.1")
     camera.add_argument("--port", type=int, default=8766)
     camera.set_defaults(func=cmd_start_camera)
@@ -551,7 +554,8 @@ def build_parser() -> argparse.ArgumentParser:
     snapshot.add_argument("--camera-url", default=DEFAULT_CAMERA_URL)
     snapshot.add_argument("--output", default="logs/latest-camera.jpg")
     snapshot.add_argument("--timeout", type=float, default=5.0)
-    snapshot.add_argument("--camera-index", type=int, default=0)
+    snapshot.add_argument("--camera-index", default="0")
+    snapshot.add_argument("--max-camera-index", type=int, default=9)
     snapshot.add_argument("--ensure-camera", action="store_true", help="Start the camera helper before fetching.")
     snapshot.set_defaults(func=cmd_camera_snapshot)
 
@@ -591,7 +595,8 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--context-file", help="File containing extra context appended to the prompt.")
     run.add_argument("--http-url", default=DEFAULT_POLICY_HTTP_URL)
     run.add_argument("--camera-url", default=DEFAULT_CAMERA_URL)
-    run.add_argument("--camera-index", type=int, default=0)
+    run.add_argument("--camera-index", default="0")
+    run.add_argument("--max-camera-index", type=int, default=9)
     run.add_argument("--ensure-camera", action="store_true", help="Start the camera helper before model control.")
     run.add_argument("--serial-port", default=DEFAULT_SERIAL_PORT)
     run.add_argument("--bitrate", type=int, default=1_000_000)
@@ -666,7 +671,8 @@ def build_parser() -> argparse.ArgumentParser:
     hybrid.add_argument("--policy-kind", choices=["lerobot-act", "modal"], default="lerobot-act")
     hybrid.add_argument("--http-url", default=DEFAULT_ONE_ARM_POLICY_HTTP_URL)
     hybrid.add_argument("--camera-url", default=DEFAULT_CAMERA_URL)
-    hybrid.add_argument("--camera-index", type=int, default=0)
+    hybrid.add_argument("--camera-index", default="0")
+    hybrid.add_argument("--max-camera-index", type=int, default=9)
     hybrid.add_argument("--ensure-camera", action="store_true", help="Start the camera helper before hybrid control.")
     hybrid.add_argument("--serial-port", default=DEFAULT_SERIAL_PORT)
     hybrid.add_argument("--bitrate", type=int, default=1_000_000)

@@ -9,8 +9,39 @@ import threading
 import time
 
 
+def _open_capture(cv2, index: int, width: int, height: int):
+    cap = cv2.VideoCapture(index)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+    if not cap.isOpened():
+        cap.release()
+        return None
+    ok, frame = cap.read()
+    if not ok or frame is None:
+        cap.release()
+        return None
+    return cap
+
+
+def _resolve_camera_index(cv2, requested: str, width: int, height: int, max_index: int) -> tuple[int, object]:
+    if requested != "auto":
+        index = int(requested)
+        cap = _open_capture(cv2, index, width, height)
+        if cap is None:
+            raise RuntimeError(f"Could not open camera index {index}")
+        return index, cap
+
+    errors = []
+    for index in range(max_index + 1):
+        cap = _open_capture(cv2, index, width, height)
+        if cap is not None:
+            return index, cap
+        errors.append(index)
+    raise RuntimeError(f"Could not open any camera index from 0..{max_index}; tried {errors}")
+
+
 class CameraState:
-    def __init__(self, index: int, width: int, height: int, quality: int):
+    def __init__(self, index: str, width: int, height: int, quality: int, max_index: int):
         import cv2
 
         self.cv2 = cv2
@@ -18,11 +49,7 @@ class CameraState:
         self.lock = threading.Lock()
         self.latest_jpeg = None
         self.stop = threading.Event()
-        self.cap = cv2.VideoCapture(index)
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-        if not self.cap.isOpened():
-            raise RuntimeError(f"Could not open camera index {index}")
+        self.index, self.cap = _resolve_camera_index(cv2, index, width, height, max_index)
 
     def run(self) -> None:
         while not self.stop.is_set():
@@ -45,7 +72,8 @@ class CameraState:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--camera-index", type=int, default=0)
+    parser.add_argument("--camera-index", default="0", help="OpenCV camera index, or 'auto' to probe indexes.")
+    parser.add_argument("--max-camera-index", type=int, default=9, help="Highest index to try when --camera-index=auto.")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8766)
     parser.add_argument("--width", type=int, default=640)
@@ -53,7 +81,7 @@ def main() -> int:
     parser.add_argument("--quality", type=int, default=85)
     args = parser.parse_args()
 
-    state = CameraState(args.camera_index, args.width, args.height, args.quality)
+    state = CameraState(args.camera_index, args.width, args.height, args.quality, args.max_camera_index)
     thread = threading.Thread(target=state.run, daemon=True)
     thread.start()
 
@@ -81,7 +109,7 @@ def main() -> int:
             return
 
     server = ThreadingHTTPServer((args.host, args.port), Handler)
-    print(f"Camera server: http://{args.host}:{args.port}/frame.jpg", flush=True)
+    print(f"Camera server: http://{args.host}:{args.port}/frame.jpg camera_index={state.index}", flush=True)
     try:
         server.serve_forever()
     finally:
