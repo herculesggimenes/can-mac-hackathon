@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 import types
@@ -87,6 +88,16 @@ def _drain_rpc_responses(ws: Any) -> int:
         drained += 1
         if not response.get("ok", True):
             print(f"websocket command error: {response.get('error', response)}", file=sys.stderr, flush=True)
+
+
+def _write_status(path: str, payload: dict[str, Any]) -> None:
+    if not path:
+        return
+    tmp_path = f"{path}.tmp"
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    with open(tmp_path, "w") as f:
+        json.dump(payload, f)
+    os.replace(tmp_path, path)
 
 
 class SOLoader:
@@ -184,6 +195,7 @@ def main() -> int:
         help="Do not block on every command_joint_pos response. Responses are still drained to keep the socket healthy.",
     )
     parser.add_argument("--max-in-flight", type=int, default=2, help="Maximum unacknowledged commands in no-wait mode.")
+    parser.add_argument("--status-path", default="", help="Optional JSON file for live leader axis diagnostics.")
     parser.add_argument("--execute", action="store_true", help="Actually send WebSocket commands. Default is dry-run.")
     args = parser.parse_args()
 
@@ -280,6 +292,21 @@ def main() -> int:
                         _rpc(ws, "command_joint_pos", {"joint_pos": q14.tolist()})
                 else:
                     print(json.dumps({"raw": raw.tolist(), "target": q14.tolist()}), flush=True)
+                _write_status(
+                    args.status_path,
+                    {
+                        "updated_at": time.time(),
+                        "motors": SO_MOTORS,
+                        "raw": raw.tolist(),
+                        "leader_base": leader_base.tolist(),
+                        "delta_raw": (raw - leader_base).tolist(),
+                        "joint_map": joint_map,
+                        "joint_signs": signs.tolist(),
+                        "locked_joints": sorted(locked_joints),
+                        "target": q14.tolist(),
+                        "in_flight": in_flight,
+                    },
+                )
 
                 elapsed = time.monotonic() - start
                 if elapsed < dt:

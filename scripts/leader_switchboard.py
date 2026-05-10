@@ -30,6 +30,7 @@ DEFAULT_CONTROL_URL = "wss://2d37-12-125-194-54.ngrok-free.app/control"
 DEFAULT_CAMERA_URL = "ws://127.0.0.1:8770/cameras"
 DEFAULT_LEADER_PORT = "/dev/cu.usbmodem5B140318401"
 LOG_PATH = ROOT / "logs" / "leader_switchboard_bridge.log"
+LEADER_STATUS_PATH = ROOT / "logs" / "leader_axes.json"
 
 
 class TeleopStart(BaseModel):
@@ -37,6 +38,7 @@ class TeleopStart(BaseModel):
     control_url: str = DEFAULT_CONTROL_URL
     leader_port: str = DEFAULT_LEADER_PORT
     kind: str = "so100"
+    joint_map: str = "0,1,2,3,4"
     joint_signs: str = "-1,-1,-1,-1,-1"
     sixth_joint_source: str = "gripper"
     sixth_joint_sign: float = -1.0
@@ -158,6 +160,8 @@ def create_app(camera_url: str) -> FastAPI:
                 config.kind,
                 "--arm",
                 config.arm,
+                "--joint-map",
+                config.joint_map,
                 "--hz",
                 str(config.hz),
                 "--max-step",
@@ -177,6 +181,8 @@ def create_app(camera_url: str) -> FastAPI:
                 str(config.sync_samples),
                 "--max-in-flight",
                 str(config.max_in_flight),
+                "--status-path",
+                str(LEADER_STATUS_PATH),
                 "--execute",
             ]
             if config.fire_and_forget:
@@ -223,6 +229,15 @@ def create_app(camera_url: str) -> FastAPI:
             return await asyncio.to_thread(_robot_rpc, control_url, "get_status", {})
         except Exception as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    @app.get("/api/leader/axes")
+    def leader_axes() -> dict[str, Any]:
+        try:
+            return json.loads(LEADER_STATUS_PATH.read_text())
+        except FileNotFoundError:
+            return {"error": "leader axis status is not available yet"}
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     @app.get("/api/robot/joints")
     async def robot_joints(control_url: str = DEFAULT_CONTROL_URL) -> list[float]:
@@ -305,7 +320,10 @@ INDEX_HTML = r"""<!doctype html>
         <label>Leader port</label>
         <input id="leaderPort">
         <div class="row">
+          <div><label>Joint map</label><input id="jointMap" value="0,1,2,3,4"></div>
           <div><label>Joint signs</label><input id="jointSigns" value="-1,-1,-1,-1,-1"></div>
+        </div>
+        <div class="row">
           <div><label>Sixth source</label><select id="sixthSource"><option>gripper</option><option>wrist_roll</option><option>none</option></select></div>
         </div>
         <div class="row">
@@ -329,6 +347,10 @@ INDEX_HTML = r"""<!doctype html>
       <section style="margin-top:14px">
         <h2>Status</h2>
         <div id="status" class="status"></div>
+      </section>
+      <section style="margin-top:14px">
+        <h2>Leader Axes</h2>
+        <div id="axes" class="status"></div>
       </section>
     </div>
     <section>
@@ -371,6 +393,7 @@ $("startBtn").onclick = async () => {
     arm: activeArm,
     control_url: $("controlUrl").value,
     leader_port: $("leaderPort").value,
+    joint_map: $("jointMap").value,
     joint_signs: $("jointSigns").value,
     sixth_joint_source: $("sixthSource").value,
     lock_joints: lockJoints(),
@@ -400,13 +423,24 @@ async function setZeroGravity(enabled) {
   await refresh();
 }
 async function refresh() {
-  const [teleop, robot] = await Promise.all([
+  const [teleop, robot, axes] = await Promise.all([
     fetch("/api/teleop/status").then(r => r.json()),
-    fetch(`/api/robot/status?control_url=${encodeURIComponent($("controlUrl").value)}`).then(r => r.json()).catch(e => ({error:String(e)}))
+    fetch(`/api/robot/status?control_url=${encodeURIComponent($("controlUrl").value)}`).then(r => r.json()).catch(e => ({error:String(e)})),
+    fetch("/api/leader/axes").then(r => r.json()).catch(e => ({error:String(e)}))
   ]);
   $("live").textContent = teleop.running ? `teleop ${teleop.config.arm}` : "teleop stopped";
   $("live").classList.toggle("live", !!teleop.running);
   $("status").textContent = JSON.stringify({teleop, robot}, null, 2);
+  $("axes").textContent = formatAxes(axes);
+}
+function formatAxes(axes) {
+  if (axes.error || !axes.motors) return JSON.stringify(axes, null, 2);
+  return axes.motors.map((name, i) => {
+    const raw = Number(axes.raw[i]).toFixed(0).padStart(5, " ");
+    const delta = Number(axes.delta_raw[i]).toFixed(0).padStart(5, " ");
+    const mapped = i < axes.joint_map.length ? ` -> J${axes.joint_map[i]}` : "";
+    return `${i}: ${name.padEnd(13)} raw=${raw} delta=${delta}${mapped}`;
+  }).join("\n");
 }
 function connectCamera() {
   if (cameraWs) cameraWs.close();
