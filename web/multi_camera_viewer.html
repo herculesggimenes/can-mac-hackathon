@@ -170,6 +170,17 @@
       color: var(--muted);
     }
 
+    .icon-button {
+      width: 28px;
+      height: 28px;
+      display: grid;
+      place-items: center;
+      padding: 0;
+      border-radius: 6px;
+      font-size: 16px;
+      line-height: 1;
+    }
+
     footer {
       display: flex;
       flex-wrap: wrap;
@@ -242,6 +253,7 @@
           <div class="meta">
             <span class="index"></span>
             <span class="fps">0 fps</span>
+            <button class="reset icon-button" title="Reset camera" aria-label="Reset camera">R</button>
           </div>
         </div>
         <div class="image-wrap">
@@ -254,6 +266,7 @@
         title: card.querySelector(".camera-title"),
         index: card.querySelector(".index"),
         fps: card.querySelector(".fps"),
+        reset: card.querySelector(".reset"),
         img: card.querySelector("img"),
         placeholder: card.querySelector(".placeholder"),
         frames: 0,
@@ -262,6 +275,12 @@
       entry.title.textContent = cameraId;
       entry.index.textContent = "index " + cameraIndex;
       entry.img.alt = cameraId;
+      entry.reset.addEventListener("click", () => {
+        if (!socket || socket.readyState !== WebSocket.OPEN) return;
+        entry.placeholder.textContent = "Resetting camera";
+        entry.placeholder.style.display = "grid";
+        socket.send(JSON.stringify({ type: "reset_camera", camera_id: cameraId }));
+      });
       cameras.set(cameraId, entry);
       grid.appendChild(card);
       return entry;
@@ -307,6 +326,8 @@
         handleFrame(payload);
       } else if (payload.type === "subscribed") {
         setStatus("Streaming", "ok");
+      } else if (payload.type === "reset_camera_result") {
+        setStatus(`Reset ${payload.reset.join(", ") || "none"}`, "ok");
       } else if (payload.type === "error") {
         setStatus(payload.error || "Error", "warn");
       }

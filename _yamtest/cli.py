@@ -955,7 +955,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--camera-specs",
         help=(
             "Comma-separated feeds. Supports id:index, id:opencv:index, "
-            "or id:orbbec:color/depth/ir/left_ir/right_ir/dual_ir/all."
+            "id:avf:device-name, or id:orbbec:color/depth/ir/left_ir/right_ir/dual_ir/all."
         ),
     )
     cameras.add_argument("--auto-count", type=int, default=3)

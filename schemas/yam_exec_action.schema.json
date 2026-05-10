@@ -1,0 +1,88 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "YamExecAction",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["tool", "args", "reason", "done", "confidence"],
+  "properties": {
+    "tool": {
+      "type": "string",
+      "enum": [
+        "move_right_cartesian",
+        "aim_right_wrist",
+        "set_gripper_right",
+        "hard_stop"
+      ]
+    },
+    "args": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "dx",
+        "dy",
+        "dz",
+        "frame",
+        "steps",
+        "hz",
+        "ik_preset",
+        "pitch_deg",
+        "yaw_deg",
+        "roll_deg",
+        "value"
+      ],
+      "properties": {
+        "dx": {
+          "type": ["number", "null"]
+        },
+        "dy": {
+          "type": ["number", "null"]
+        },
+        "dz": {
+          "type": ["number", "null"]
+        },
+        "frame": {
+          "type": ["string", "null"],
+          "enum": ["world", "local", null]
+        },
+        "steps": {
+          "type": ["integer", "null"],
+          "minimum": 8,
+          "maximum": 80
+        },
+        "hz": {
+          "type": ["number", "null"],
+          "minimum": 80,
+          "maximum": 160
+        },
+        "ik_preset": {
+          "type": ["string", "null"],
+          "enum": ["strict", "live", "loose", null]
+        },
+        "pitch_deg": {
+          "type": ["number", "null"]
+        },
+        "yaw_deg": {
+          "type": ["number", "null"]
+        },
+        "roll_deg": {
+          "type": ["number", "null"]
+        },
+        "value": {
+          "type": ["number", "null"]
+        }
+      }
+    },
+    "reason": {
+      "type": "string",
+      "minLength": 1
+    },
+    "done": {
+      "type": "boolean"
+    },
+    "confidence": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    }
+  }
+}

@@ -19,6 +19,15 @@ def _save_frame(frame: dict, output_dir: Path) -> None:
     path = output_dir / f"{camera_id}.jpg"
     path.write_bytes(base64.b64decode(frame["data"]))
     print(f"saved {camera_id}: {path} ({path.stat().st_size} bytes)")
+    depth = frame.get("depth")
+    if depth and depth.get("data"):
+        raw_path = output_dir / f"{camera_id}.u16"
+        meta_path = output_dir / f"{camera_id}.depth.json"
+        raw_path.write_bytes(base64.b64decode(depth["data"]))
+        metadata = dict(depth)
+        metadata.pop("data", None)
+        meta_path.write_text(json.dumps(metadata, indent=2) + "\n")
+        print(f"saved {camera_id} depth: {raw_path} ({raw_path.stat().st_size} bytes), {meta_path}")
 
 
 def main() -> int:
@@ -28,6 +37,7 @@ def main() -> int:
     parser.add_argument("--subscribe", action="store_true")
     parser.add_argument("--fps", type=float, default=2.0)
     parser.add_argument("--frames", type=int, default=1, help="Frame batches to save when subscribing.")
+    parser.add_argument("--reset-camera", help="Reset one camera id and exit, e.g. top.")
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir).expanduser()
@@ -36,6 +46,10 @@ def main() -> int:
     with connect(args.url, open_timeout=10, max_size=32 * 1024 * 1024) as ws:
         hello = json.loads(ws.recv())
         print(json.dumps(hello, indent=2))
+        if args.reset_camera:
+            ws.send(json.dumps({"type": "reset_camera", "camera_id": args.reset_camera}))
+            print(json.dumps(json.loads(ws.recv()), indent=2))
+            return 0
         if args.subscribe:
             ws.send(json.dumps({"type": "subscribe", "fps": args.fps, "cameras": "all", "bundle": True}))
         else:

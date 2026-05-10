@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "YamPixelLocator",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "target_u",
+    "target_v",
+    "gripper_u",
+    "gripper_v",
+    "confidence",
+    "reason"
+  ],
+  "properties": {
+    "target_u": {
+      "type": ["integer", "null"],
+      "minimum": 0
+    },
+    "target_v": {
+      "type": ["integer", "null"],
+      "minimum": 0
+    },
+    "gripper_u": {
+      "type": ["integer", "null"],
+      "minimum": 0
+    },
+    "gripper_v": {
+      "type": ["integer", "null"],
+      "minimum": 0
+    },
+    "confidence": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "reason": {
+      "type": "string",
+      "minLength": 1
+    }
+  }
+}

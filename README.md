@@ -125,6 +125,154 @@ Protocol:
 {"type":"stop"}
 ```
 
+Orbbec depth frames include the normal JPEG preview plus raw metric depth when
+available:
+
+```json
+{
+  "camera_id": "right_depth",
+  "intrinsics": {"fx": 500.0, "fy": 500.0, "cx": 320.0, "cy": 200.0},
+  "depth": {
+    "format": "uint16",
+    "width": 640,
+    "height": 400,
+    "scale_to_meters": 0.001,
+    "data": "<base64 little-endian uint16>"
+  }
+}
+```
+
+Convert a depth pixel to a 3D camera-frame point:
+
+```bash
+uv run python scripts/yam_depth_geometry.py logs/yam-snapshots/latest/camera_payload.json \
+  --camera-id right_depth \
+  --u 320 \
+  --v 200
+```
+
+Collect one Codex-optimized snapshot before planning robot actions. This writes
+`codex_snapshot.json`, saves all camera images, summarizes robot state, and
+samples depth into compact camera-frame 3D points:
+
+```bash
+uv run python scripts/yam_codex_snapshot.py \
+  --robot-url wss://2d37-12-125-194-54.ngrok-free.app/control \
+  --camera-url ws://127.0.0.1:8770/cameras \
+  --depth-grid 3
+```
+
+Use `codex_snapshot.json` as the primary planning input. It includes the 14D
+joint order, both-arm gripper values, wrist camera joints, saved image paths,
+depth quality, center depth, sampled depth grid points, and recommended command
+primitives. It also writes `codex_contact_sheet.jpg`, a single large image with
+all cameras tiled together for faster visual inspection.
+
+Plan a bounded IK move from a depth pixel. This is dry-run unless `--execute`
+is passed:
+
+```bash
+uv run python scripts/yam_move_to_depth_pixel.py logs/yam-snapshots/latest/camera_payload.json \
+  --camera-id depth \
+  --u 320 \
+  --v 200 \
+  --calibration config/yam_camera_calibration.json \
+  --control-url wss://2d37-12-125-194-54.ngrok-free.app/control \
+  --arm right \
+  --target-offset 0,0,0.06
+```
+
+The calibration file must contain a 4x4 camera-to-robot transform:
+
+```json
+{
+  "T_robot_camera": [
+    [1, 0, 0, 0],
+    [0, 1, 0, 0],
+    [0, 0, 1, 0],
+    [0, 0, 0, 1]
+  ]
+}
+```
+
+Run a calibration-free local visual-servo touch test. This tracks the selected
+depth-preview pixel, probes tiny joint movements to estimate a local image
+Jacobian, then takes bounded steps toward the image center and desired depth.
+It does not need `T_robot_camera`, but it must be run with `--execute` to learn
+the local Jacobian from real motion:
+
+```bash
+uv run python scripts/yam_visual_servo_touch.py \
+  --control-url wss://2d37-12-125-194-54.ngrok-free.app/control \
+  --camera-url ws://127.0.0.1:8770/cameras \
+  --camera-id depth \
+  --arm right \
+  --target-u 297 \
+  --target-v 88 \
+  --desired-depth-m 0.035 \
+  --max-joint-step 0.02 \
+  --iterations 1 \
+  --execute
+```
+
+Use Cartesian IK for smoother manual control instead of per-joint deltas. This
+reads the current 14D state, applies an end-effector delta, solves IK for one
+arm, and sends an interpolated full-14D trajectory:
+
+```bash
+uv run python scripts/yam_cartesian_control.py \
+  --control-url wss://2d37-12-125-194-54.ngrok-free.app/control \
+  --arm right \
+  --frame local \
+  --delta 0,0,-0.03 \
+  --max-joint-delta 0.10 \
+  --steps 20 \
+  --hz 60 \
+  --execute
+```
+
+Use `--frame local` for gripper-relative moves and `--frame world` for robot
+world-axis moves. Omit `--execute` to inspect the planned 14D command first.
+The execution path keeps one WebSocket open for the full trajectory; use
+`--hz` plus `--steps` to tune smoothness and speed.
+For wrist-camera aiming, use the camera rotation convenience flags. `--wrist-only`
+keeps joints 1-3 fixed after IK so joints 4-6 do the pitch/yaw/roll work:
+
+```bash
+uv run python scripts/yam_cartesian_control.py \
+  --control-url wss://2d37-12-125-194-54.ngrok-free.app/control \
+  --arm right \
+  --frame local \
+  --delta 0,0,0 \
+  --camera-pitch-deg -12 \
+  --wrist-only \
+  --max-segment-rad 0.08 \
+  --max-joint-delta 0.10 \
+  --steps 20 \
+  --hz 80 \
+  --execute
+```
+
+Use `--camera-yaw-deg` and `--camera-roll-deg` the same way. If the wrist camera
+mount is inverted, flip the sign of the pitch or yaw command.
+For larger task-level moves, pass the full desired delta and let the script
+split it into Cartesian IK segments:
+
+```bash
+uv run python scripts/yam_cartesian_control.py \
+  --control-url wss://2d37-12-125-194-54.ngrok-free.app/control \
+  --arm right \
+  --frame local \
+  --delta 0,0,-0.12 \
+  --max-segment-m 0.03 \
+  --max-joint-delta 0.20 \
+  --steps 20 \
+  --hz 80 \
+  --no-stop-on-ik-failure \
+  --allow-nonconverged-segments \
+  --execute
+```
+
 Debug all frames:
 
 ```bash
