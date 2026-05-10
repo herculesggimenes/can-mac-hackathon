@@ -381,6 +381,89 @@ def _command_bimanual(
     return cmd_l, cmd_r, time.time()
 
 
+def _execute_policy_targets_single(
+    robot,
+    targets: list[np.ndarray],
+    state_start: np.ndarray,
+    args: argparse.Namespace,
+    trace: Trace,
+    iteration: int,
+) -> tuple[np.ndarray, int]:
+    """Apply policy targets; optionally linearly interpolate in joint space at ~fixed dt."""
+
+    prev = np.asarray(state_start, dtype=float).reshape(-1).copy()
+    executed = 0
+    last_command = prev.copy()
+    stream_hz = float(getattr(args, "command_stream_hz", 0.0) or 0.0)
+    for target in targets:
+        tgt = np.asarray(target, dtype=float).reshape(-1)
+        if tgt.shape[0] != 7:
+            continue
+        if stream_hz > 0:
+            dt = 1.0 / stream_hz
+            dur = max(float(args.action_step_delay), 2.0 * dt)
+            n_steps = max(2, int(math.ceil(dur / dt)))
+            for k in range(1, n_steps + 1):
+                alpha = k / n_steps
+                interp = prev + alpha * (tgt - prev)
+                last_command, _ = _command_target(robot, interp, args)
+                time.sleep(dt)
+        else:
+            last_command, _ = _command_target(robot, tgt, args)
+            time.sleep(args.action_step_delay)
+        trace.write(
+            "policy_command",
+            iteration=iteration,
+            commanded=last_command.tolist(),
+            target=tgt.tolist(),
+            streamed=stream_hz > 0,
+        )
+        prev = tgt.copy()
+        executed += 1
+    return last_command, executed
+
+
+def _execute_policy_targets_bimanual(
+    robot_left,
+    robot_right,
+    targets: list[np.ndarray],
+    state_start14: np.ndarray,
+    args: argparse.Namespace,
+    trace: Trace,
+    iteration: int,
+) -> tuple[np.ndarray, np.ndarray, int]:
+    prev = np.asarray(state_start14, dtype=float).reshape(14).copy()
+    executed = 0
+    stream_hz = float(getattr(args, "command_stream_hz", 0.0) or 0.0)
+    last_command_l = prev[:7].copy()
+    last_command_r = prev[7:].copy()
+    for target in targets:
+        tgt = np.asarray(target, dtype=float).reshape(14)
+        if stream_hz > 0:
+            dt = 1.0 / stream_hz
+            dur = max(float(args.action_step_delay), 2.0 * dt)
+            n_steps = max(2, int(math.ceil(dur / dt)))
+            for k in range(1, n_steps + 1):
+                alpha = k / n_steps
+                interp = prev + alpha * (tgt - prev)
+                last_command_l, last_command_r, _ = _command_bimanual(robot_left, robot_right, interp, args)
+                time.sleep(dt)
+        else:
+            last_command_l, last_command_r, _ = _command_bimanual(robot_left, robot_right, tgt, args)
+            time.sleep(args.action_step_delay)
+        trace.write(
+            "policy_command",
+            iteration=iteration,
+            commanded_left=last_command_l.tolist(),
+            commanded_right=last_command_r.tolist(),
+            target=tgt.tolist(),
+            streamed=stream_hz > 0,
+        )
+        prev = tgt.copy()
+        executed += 1
+    return last_command_l, last_command_r, executed
+
+
 def _direct_delta(robot, delta: list[float], last_command: np.ndarray, args: argparse.Namespace, trace: Trace, label: str) -> np.ndarray:
     current = np.asarray(robot.get_joint_pos(), dtype=float)
     target = current + np.asarray(delta, dtype=float)
@@ -729,24 +812,25 @@ def run(args: argparse.Namespace) -> int:
                 trace.write("observe_only_skip_execute", iteration=iteration, targets=len(targets))
             elif arms == "bimanual":
                 assert robot_left is not None and robot_right is not None
-                for target in targets:
-                    last_command_l, last_command_r, _ = _command_bimanual(robot_left, robot_right, target, args)
-                    executed += 1
-                    trace.write(
-                        "policy_command",
-                        iteration=iteration,
-                        commanded_left=last_command_l.tolist(),
-                        commanded_right=last_command_r.tolist(),
-                        target=np.asarray(target).tolist(),
-                    )
-                    time.sleep(args.action_step_delay)
+                last_command_l, last_command_r, executed = _execute_policy_targets_bimanual(
+                    robot_left,
+                    robot_right,
+                    targets,
+                    state,
+                    args,
+                    trace,
+                    iteration,
+                )
             else:
                 assert robot is not None
-                for target in targets:
-                    last_command, _ = _command_target(robot, target, args)
-                    executed += 1
-                    trace.write("policy_command", iteration=iteration, commanded=last_command.tolist(), target=np.asarray(target).tolist())
-                    time.sleep(args.action_step_delay)
+                last_command, executed = _execute_policy_targets_single(
+                    robot,
+                    targets,
+                    state,
+                    args,
+                    trace,
+                    iteration,
+                )
 
             raw_after = _raw_wrist_rgb(args, right_cap, orbbec_right)
             after_rgb = np.asarray(raw_after, dtype=np.uint8)
@@ -868,8 +952,25 @@ def main() -> int:
     parser.add_argument("--max-gripper-command", type=float, default=0.59)
     parser.add_argument("--arm-slice", choices=["first", "second"], default="first")
     parser.add_argument("--action-step", type=int, default=0)
-    parser.add_argument("--execute-action-steps", type=int, default=3)
-    parser.add_argument("--action-step-delay", type=float, default=0.05)
+    parser.add_argument(
+        "--execute-action-steps",
+        type=int,
+        default=15,
+        help="How many rows from the policy trajectory to execute before the next /infer (Modal often returns ~30).",
+    )
+    parser.add_argument(
+        "--action-step-delay",
+        type=float,
+        default=0.03,
+        help="Seconds budget between discrete policy waypoints; also minimum segment duration when streaming.",
+    )
+    parser.add_argument(
+        "--command-stream-hz",
+        type=float,
+        default=25.0,
+        help="If >0, linearly interpolate joint targets at ~this rate (fixed dt=1/hz) between consecutive "
+        "waypoints. Set to 0 to send only discrete policy rows with --action-step-delay between them.",
+    )
     parser.add_argument("--stop-on-model-warning", action="store_true")
     parser.add_argument("--observe-only", action="store_true", help="Call policy and write diagnostics without commanding robot motion.")
     parser.add_argument("--codex-corrections", action="store_true")
@@ -910,6 +1011,9 @@ def main() -> int:
     args = parser.parse_args()
     if not math.isfinite(args.hz) or args.hz <= 0:
         parser.error("--hz must be positive")
+    cs_hz = getattr(args, "command_stream_hz", 0.0)
+    if cs_hz < 0 or not math.isfinite(cs_hz):
+        parser.error("--command-stream-hz must be a non-negative finite number (use 0 to disable interpolation)")
     return run(args)
 
 

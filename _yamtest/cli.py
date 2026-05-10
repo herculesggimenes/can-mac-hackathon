@@ -798,6 +798,8 @@ def cmd_hybrid(args: argparse.Namespace) -> int:
         str(args.execute_action_steps),
         "--action-step-delay",
         str(args.action_step_delay),
+        "--command-stream-hz",
+        str(args.command_stream_hz),
         "--align-px",
         str(args.align_px),
         "--descend-px",
@@ -1186,8 +1188,24 @@ def build_parser() -> argparse.ArgumentParser:
     hybrid.add_argument("--max-gripper-command", type=float, default=0.59)
     hybrid.add_argument("--arm-slice", choices=["first", "second"], default="first")
     hybrid.add_argument("--action-step", type=int, default=0)
-    hybrid.add_argument("--execute-action-steps", type=int, default=3)
-    hybrid.add_argument("--action-step-delay", type=float, default=0.05)
+    hybrid.add_argument(
+        "--execute-action-steps",
+        type=int,
+        default=15,
+        help="Policy trajectory rows to run per infer (hybrid_robot_loop; Modal chunks are often ~30 long).",
+    )
+    hybrid.add_argument(
+        "--action-step-delay",
+        type=float,
+        default=0.03,
+        help="Pause between discrete waypoints; min segment length when --command-stream-hz > 0.",
+    )
+    hybrid.add_argument(
+        "--command-stream-hz",
+        type=float,
+        default=25.0,
+        help="Joint-space interpolation rate between waypoints; 0 = discrete commands only.",
+    )
     hybrid.add_argument("--codex-corrections", action="store_true", help="Enable local visual correction moves.")
     hybrid.add_argument("--auto-grasp", action="store_true", help="Allow local close-and-lift correction when aligned.")
     hybrid.add_argument("--align-px", type=float, default=55.0)
