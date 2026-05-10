@@ -127,6 +127,8 @@ def _process_lines() -> list[str]:
         "start_bimanual_bridges.sh",
         "teleop_viewer.py",
         "camera_http_server.py",
+        "multi_camera_ws_server.py",
+        "yam_control_ws_server.py",
         "yam_lerobot_policy_server.py",
         "modal_molmoact2_service.py",
     )
@@ -159,6 +161,7 @@ def _robot_owner_lines() -> list[str]:
         "teleop_viewer.py",
         "direct_robot_control.py",
         "direct_bimanual_parallel.py",
+        "yam_control_ws_server.py",
     )
     ignored = ("/opt/homebrew/bin/nvim", " rg ", "rg ")
     return [
@@ -188,6 +191,9 @@ def _start_background(name: str, cmd: list[str], *, env: dict[str, str] | None =
         "camera": ["camera_http_server.py"],
         # Avoid matching the main ``camera`` helper: discovery uses probe-only before start in cmd_hybrid.
         "camera_left": [],
+        "cameras": ["multi_camera_ws_server.py"],
+        "bridge": ["slcan_bridge.py"],
+        "control": ["yam_control_ws_server.py"],
         "viewer": ["teleop_viewer.py"],
         "model": ["hybrid_robot_loop.py", "local_modal_robot_bridge.py", "direct_bimanual_parallel.py"],
         "policy": ["yam_lerobot_policy_server.py"],
@@ -267,7 +273,7 @@ def cmd_status(_args: argparse.Namespace) -> int:
         "can1_socket": CAN1_SOCKET.exists(),
         "pid_files": {
             name: {"pid": _read_pid(name), "running": _pid_running(_read_pid(name))}
-            for name in ("camera", "camera_left", "bridge", "viewer", "model", "policy")
+            for name in ("camera", "camera_left", "cameras", "bridge", "viewer", "control", "model", "policy")
         },
         "processes": _process_lines(),
     }
@@ -391,6 +397,31 @@ def cmd_orbbec_camera_hint(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_start_cameras(args: argparse.Namespace) -> int:
+    cmd = [
+        _python(),
+        "scripts/multi_camera_ws_server.py",
+        "--host",
+        args.host,
+        "--port",
+        str(args.port),
+        "--max-camera-index",
+        str(args.max_camera_index),
+        "--width",
+        str(args.width),
+        "--height",
+        str(args.height),
+        "--quality",
+        str(args.quality),
+    ]
+    if args.camera_specs:
+        cmd.extend(["--camera-specs", args.camera_specs])
+    else:
+        cmd.extend(["--auto-count", str(args.auto_count)])
+    _start_background("cameras", cmd)
+    return 0
+
+
 def cmd_camera_snapshot(args: argparse.Namespace) -> int:
     if args.ensure_camera:
         camera_args = argparse.Namespace(camera_index=args.camera_index, max_camera_index=args.max_camera_index, host="127.0.0.1", port=8766)
@@ -484,6 +515,48 @@ def cmd_start_viewer(args: argparse.Namespace) -> int:
         _start_background("viewer", cmd, env=env)
         return 0
     return subprocess.call(cmd, cwd=ROOT, env={**os.environ, **env})
+
+
+def cmd_start_control_server(args: argparse.Namespace) -> int:
+    if not _ensure_no_robot_owner(allow=args.allow_concurrent_owner):
+        return 1
+    if args.arm_specs and args.arm_specs != f"{args.arm_id}:can0":
+        print(
+            "multi-arm control expects one SLCAN bridge per arm channel, for example "
+            "`slcan_bridge.py --serial /dev/cu.LEFT --socket /tmp/can0.sock` and "
+            "`slcan_bridge.py --serial /dev/cu.RIGHT --socket /tmp/can1.sock`.",
+            file=sys.stderr,
+        )
+    elif not args.no_bridge:
+        bridge_args = argparse.Namespace(serial_port=args.serial_port, bitrate=args.bitrate)
+        if cmd_start_bridge(bridge_args) != 0:
+            return 1
+    cmd = [
+        _python(),
+        "scripts/yam_control_ws_server.py",
+        "--host",
+        args.host,
+        "--port",
+        str(args.port),
+        "--arm-id",
+        args.arm_id,
+        "--channel",
+        args.channel,
+        "--min-gripper",
+        str(args.min_gripper),
+        "--max-gripper",
+        str(args.max_gripper),
+        "--reconnect-initial-delay",
+        str(args.reconnect_initial_delay),
+        "--reconnect-max-delay",
+        str(args.reconnect_max_delay),
+    ]
+    if args.arm_specs:
+        cmd.extend(["--arm-specs", args.arm_specs])
+    if args.background:
+        _start_background("control", cmd)
+        return 0
+    return subprocess.call(cmd, cwd=ROOT)
 
 
 def cmd_stop(args: argparse.Namespace) -> int:
@@ -911,6 +984,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     orbbec.set_defaults(func=cmd_orbbec_camera_hint)
 
+    cameras = sub.add_parser("cameras", help="Start one WebSocket endpoint for multiple camera feeds.")
+    cameras.add_argument(
+        "--camera-specs",
+        help=(
+            "Comma-separated feeds. Supports id:index, id:opencv:index, "
+            "or id:orbbec:color/depth/ir/left_ir/right_ir/dual_ir/all."
+        ),
+    )
+    cameras.add_argument("--auto-count", type=int, default=3)
+    cameras.add_argument("--max-camera-index", type=int, default=12)
+    cameras.add_argument("--host", default="0.0.0.0")
+    cameras.add_argument("--port", type=int, default=8770)
+    cameras.add_argument("--width", type=int, default=640)
+    cameras.add_argument("--height", type=int, default=360)
+    cameras.add_argument("--quality", type=int, default=80)
+    cameras.set_defaults(func=cmd_start_cameras)
+
     snapshot = sub.add_parser("camera-snapshot", help="Capture one local camera frame to a JPEG.")
     snapshot.add_argument("--camera-url", default=DEFAULT_CAMERA_URL)
     snapshot.add_argument("--output", default="logs/latest-camera.jpg")
@@ -943,12 +1033,29 @@ def build_parser() -> argparse.ArgumentParser:
     viewer.add_argument("--background", action="store_true")
     viewer.set_defaults(func=cmd_start_viewer)
 
+    control = sub.add_parser("control-server", help="Start the simple YAM WebSocket control server.")
+    control.add_argument("--serial-port", default=DEFAULT_SERIAL_PORT)
+    control.add_argument("--bitrate", type=int, default=1_000_000)
+    control.add_argument("--host", default="127.0.0.1")
+    control.add_argument("--port", type=int, default=8780)
+    control.add_argument("--arm-id", default="left")
+    control.add_argument("--channel", default="can0")
+    control.add_argument("--arm-specs", help="Comma-separated arm_id:channel list, e.g. left:can0,right:can1.")
+    control.add_argument("--min-gripper", type=float, default=0.01)
+    control.add_argument("--max-gripper", type=float, default=0.59)
+    control.add_argument("--reconnect-initial-delay", type=float, default=0.5)
+    control.add_argument("--reconnect-max-delay", type=float, default=5.0)
+    control.add_argument("--no-bridge", action="store_true", help="Do not auto-start the single /tmp/can0.sock bridge.")
+    control.add_argument("--background", action="store_true")
+    control.add_argument("--allow-concurrent-owner", action="store_true", help="Bypass the single robot-owner guard.")
+    control.set_defaults(func=cmd_start_control_server)
+
     stop = sub.add_parser("stop", help="Stop background processes tracked by yamctl.")
     stop.add_argument(
         "targets",
         nargs="*",
-        default=["model", "viewer", "policy", "bridge"],
-        choices=["model", "viewer", "policy", "bridge", "camera"],
+        default=["model", "viewer", "control", "policy", "cameras", "bridge"],
+        choices=["model", "viewer", "control", "policy", "bridge", "camera", "cameras"],
     )
     stop.add_argument("--hard-stop", action="store_true", help="Set HARD_STOP before stopping processes.")
     stop.set_defaults(func=cmd_stop)

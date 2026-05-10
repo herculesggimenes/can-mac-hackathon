@@ -1,0 +1,347 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>YAM Multi-Camera Viewer</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #101113;
+      --panel: #181a1d;
+      --line: #30343a;
+      --text: #eef0f3;
+      --muted: #a5abb4;
+      --accent: #4da3ff;
+      --ok: #45c46f;
+      --warn: #ffbc42;
+      --bad: #ff5d5d;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html,
+    body {
+      margin: 0;
+      min-height: 100%;
+      background: var(--bg);
+      color: var(--text);
+      font: 14px/1.4 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    body {
+      display: flex;
+      flex-direction: column;
+    }
+
+    header {
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      padding: 12px;
+      border-bottom: 1px solid var(--line);
+      background: var(--panel);
+    }
+
+    label {
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .field {
+      display: flex;
+      flex: 1;
+      min-width: 220px;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    input {
+      width: 100%;
+      height: 34px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #0d0e10;
+      color: var(--text);
+      padding: 0 10px;
+      font: inherit;
+    }
+
+    button {
+      height: 34px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #24282e;
+      color: var(--text);
+      padding: 0 12px;
+      font: inherit;
+      cursor: pointer;
+    }
+
+    button.primary {
+      border-color: #2c75bd;
+      background: #1c5f9f;
+    }
+
+    main {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+      gap: 12px;
+      padding: 12px;
+      width: 100%;
+    }
+
+    .camera {
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      min-height: 260px;
+    }
+
+    .camera-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 10px;
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .camera-title {
+      font-weight: 650;
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .meta {
+      display: flex;
+      gap: 8px;
+      color: var(--muted);
+      font-size: 12px;
+      white-space: nowrap;
+    }
+
+    .status {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      color: var(--muted);
+      white-space: nowrap;
+    }
+
+    .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 999px;
+      background: var(--bad);
+    }
+
+    .dot.ok {
+      background: var(--ok);
+    }
+
+    .dot.warn {
+      background: var(--warn);
+    }
+
+    .image-wrap {
+      position: relative;
+      aspect-ratio: 16 / 9;
+      background: #050506;
+    }
+
+    img {
+      display: block;
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+    }
+
+    .placeholder {
+      position: absolute;
+      inset: 0;
+      display: grid;
+      place-items: center;
+      color: var(--muted);
+    }
+
+    footer {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 14px;
+      padding: 10px 12px;
+      border-top: 1px solid var(--line);
+      color: var(--muted);
+      background: var(--panel);
+      font-size: 12px;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="field">
+      <label for="url">WebSocket URL</label>
+      <input id="url" spellcheck="false">
+    </div>
+    <div class="field" style="max-width: 120px;">
+      <label for="fps">FPS</label>
+      <input id="fps" type="number" min="0.1" max="30" step="0.5" value="5">
+    </div>
+    <button id="connect" class="primary">Connect</button>
+    <button id="disconnect">Disconnect</button>
+    <div class="status"><span id="dot" class="dot"></span><span id="status">Disconnected</span></div>
+  </header>
+
+  <main id="grid"></main>
+
+  <footer>
+    <span id="summary">No frames received</span>
+    <span>Protocol: <code>{"type":"subscribe","cameras":"all","bundle":true}</code></span>
+  </footer>
+
+  <script>
+    const urlInput = document.getElementById("url");
+    const fpsInput = document.getElementById("fps");
+    const connectButton = document.getElementById("connect");
+    const disconnectButton = document.getElementById("disconnect");
+    const statusText = document.getElementById("status");
+    const statusDot = document.getElementById("dot");
+    const grid = document.getElementById("grid");
+    const summary = document.getElementById("summary");
+
+    const params = new URLSearchParams(window.location.search);
+    const defaultUrl = params.get("ws") || localStorage.getItem("yam.multiCameraWs") || "ws://127.0.0.1:8770/cameras";
+    urlInput.value = defaultUrl;
+
+    let socket = null;
+    const cameras = new Map();
+    const stats = { frames: 0, startedAt: 0 };
+
+    function setStatus(text, kind) {
+      statusText.textContent = text;
+      statusDot.className = "dot" + (kind ? " " + kind : "");
+    }
+
+    function cameraCard(cameraId, cameraIndex) {
+      if (cameras.has(cameraId)) {
+        const existing = cameras.get(cameraId);
+        existing.index.textContent = "index " + cameraIndex;
+        return existing;
+      }
+
+      const card = document.createElement("section");
+      card.className = "camera";
+      card.innerHTML = `
+        <div class="camera-head">
+          <div class="camera-title"></div>
+          <div class="meta">
+            <span class="index"></span>
+            <span class="fps">0 fps</span>
+          </div>
+        </div>
+        <div class="image-wrap">
+          <div class="placeholder">Waiting for frame</div>
+          <img alt="">
+        </div>
+      `;
+      const entry = {
+        card,
+        title: card.querySelector(".camera-title"),
+        index: card.querySelector(".index"),
+        fps: card.querySelector(".fps"),
+        img: card.querySelector("img"),
+        placeholder: card.querySelector(".placeholder"),
+        frames: 0,
+        lastTick: performance.now(),
+      };
+      entry.title.textContent = cameraId;
+      entry.index.textContent = "index " + cameraIndex;
+      entry.img.alt = cameraId;
+      cameras.set(cameraId, entry);
+      grid.appendChild(card);
+      return entry;
+    }
+
+    function handleFrame(frame) {
+      if (frame.type !== "frame") return;
+      const entry = cameraCard(frame.camera_id, frame.camera_index);
+      entry.img.src = "data:image/jpeg;base64," + frame.data;
+      entry.placeholder.style.display = "none";
+      entry.frames += 1;
+      stats.frames += 1;
+
+      const now = performance.now();
+      const dt = Math.max((now - entry.lastTick) / 1000, 0.001);
+      if (entry.frames % 5 === 0) {
+        entry.fps.textContent = (5 / dt).toFixed(1) + " fps";
+        entry.lastTick = now;
+      }
+
+      const elapsed = Math.max((Date.now() - stats.startedAt) / 1000, 1);
+      summary.textContent = `${stats.frames} frames | ${cameras.size} cameras | ${(stats.frames / elapsed).toFixed(1)} aggregate fps`;
+    }
+
+    function handleMessage(event) {
+      let payload;
+      try {
+        payload = JSON.parse(event.data);
+      } catch (error) {
+        console.warn("non-json message", event.data);
+        return;
+      }
+
+      if (payload.type === "hello") {
+        for (const camera of payload.cameras || []) {
+          cameraCard(camera.camera_id, camera.camera_index);
+        }
+        const fps = Number(fpsInput.value) || 5;
+        socket.send(JSON.stringify({ type: "subscribe", fps, cameras: "all", bundle: true }));
+      } else if (payload.type === "frames") {
+        for (const frame of payload.frames || []) handleFrame(frame);
+      } else if (payload.type === "frame") {
+        handleFrame(payload);
+      } else if (payload.type === "subscribed") {
+        setStatus("Streaming", "ok");
+      } else if (payload.type === "error") {
+        setStatus(payload.error || "Error", "warn");
+      }
+    }
+
+    function connect() {
+      disconnect();
+      const url = urlInput.value.trim();
+      if (!url) return;
+      localStorage.setItem("yam.multiCameraWs", url);
+      stats.frames = 0;
+      stats.startedAt = Date.now();
+      setStatus("Connecting", "warn");
+      socket = new WebSocket(url);
+      socket.addEventListener("open", () => setStatus("Connected", "warn"));
+      socket.addEventListener("message", handleMessage);
+      socket.addEventListener("close", () => setStatus("Disconnected", ""));
+      socket.addEventListener("error", () => setStatus("Socket error", "warn"));
+    }
+
+    function disconnect() {
+      if (socket && socket.readyState <= WebSocket.OPEN) {
+        try { socket.send(JSON.stringify({ type: "stop" })); } catch (error) {}
+        socket.close();
+      }
+      socket = null;
+    }
+
+    connectButton.addEventListener("click", connect);
+    disconnectButton.addEventListener("click", disconnect);
+    window.addEventListener("beforeunload", disconnect);
+
+    if (params.get("autoconnect") === "1") {
+      connect();
+    }
+  </script>
+</body>
+</html>

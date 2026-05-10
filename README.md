@@ -50,6 +50,193 @@ uv run yamctl bridge
 uv run yamctl viewer
 ```
 
+Expose the same simple YAM joint API over WebSocket when another process needs
+to drive the arm instead of the local viewer:
+
+```bash
+uv run yamctl stop viewer model --hard-stop
+uv run yamctl control-server --background
+
+uv run python scripts/yam_ws_client.py --method get_joint_pos
+uv run python scripts/yam_ws_client.py \
+  --method command_joint_pos \
+  --params '{"joint_pos":[0,0,0,0,0,0,0.3]}'
+```
+
+The WebSocket endpoint is:
+
+```text
+ws://<robot-mac-ip>:8780/control
+```
+
+It accepts JSON-RPC-style calls with the YAM method names:
+
+```json
+{"id":"1","method":"get_joint_pos","params":{}}
+{"id":"2","method":"command_joint_pos","params":{"joint_pos":[0,0,0,0,0,0,0.3]}}
+{"id":"3","method":"get_observations","params":{}}
+{"id":"4","method":"zero_torque_mode","params":{}}
+{"id":"5","method":"get_status","params":{}}
+{"id":"6","method":"reconnect","params":{"arm":"left"}}
+```
+
+If a CAN socket or arm drops, the server keeps running, marks that arm as
+disconnected in `get_status` / `get_state`, and retries with exponential
+backoff. Tune reconnect timing with `--reconnect-initial-delay` and
+`--reconnect-max-delay`. Command calls fail fast while an arm is disconnected;
+read calls still show which arms are healthy.
+
+For two YAM arms, run one SLCAN bridge per CAN adapter/socket and start the
+control server with explicit arm ids:
+
+```bash
+uv run python can-bridge/slcan_bridge.py \
+  --serial /dev/cu.LEFT_CANABLE \
+  --socket /tmp/can0.sock \
+  --bitrate 1000000
+
+uv run python can-bridge/slcan_bridge.py \
+  --serial /dev/cu.RIGHT_CANABLE \
+  --socket /tmp/can1.sock \
+  --bitrate 1000000
+
+uv run yamctl control-server \
+  --no-bridge \
+  --arm-specs left:can0,right:can1 \
+  --host 0.0.0.0
+```
+
+Two arms need separate CAN buses unless the motor ids are remapped, because each
+stock YAM uses ids `1..7`. With multiple arms connected, write commands must
+include the target arm:
+
+```json
+{"id":"left-open","method":"command_joint_pos","params":{"arm":"left","joint_pos":[0,0,0,0,0,0,0.59]}}
+{"id":"right-state","method":"get_joint_pos","params":{"arm":"right"}}
+```
+
+Read-only calls without `arm` return a map for every connected arm.
+
+Expose the camera as HTTP JPEG plus a WebSocket stream:
+
+```bash
+uv run yamctl camera \
+  --camera-index auto \
+  --host 0.0.0.0 \
+  --port 8766 \
+  --ws-port 8767
+```
+
+The HTTP endpoint remains:
+
+```text
+http://<robot-mac-ip>:8766/frame.jpg
+```
+
+The WebSocket endpoint is:
+
+```text
+ws://<robot-mac-ip>:8767/camera
+```
+
+Send one of these JSON messages:
+
+```json
+{"type":"get_frame","encoding":"base64"}
+{"type":"subscribe","fps":10,"encoding":"binary"}
+{"type":"stop"}
+```
+
+For ngrok, expose the WebSocket port:
+
+```bash
+ngrok http 8767
+```
+
+Then connect with:
+
+```text
+wss://<ngrok-id>.ngrok-free.app/camera
+```
+
+Debug a WebSocket frame request:
+
+```bash
+uv run python scripts/ws_camera_client.py \
+  ws://127.0.0.1:8767/camera \
+  --output logs/ws-camera-frame.jpg
+```
+
+For three cameras, prefer the centralized multiplexed endpoint:
+
+```bash
+uv run yamctl cameras \
+  --camera-specs front:0,top:1,wrist:2 \
+  --host 0.0.0.0 \
+  --port 8770
+```
+
+Specs can mix normal OpenCV cameras with Orbbec SDK feeds:
+
+```bash
+uv run yamctl cameras \
+  --camera-specs top:opencv:2,left:opencv:3,right:orbbec:all \
+  --host 0.0.0.0 \
+  --port 8770
+```
+
+`right:orbbec:all` exports separate logical feeds for `right_color`,
+`right_depth`, `right_ir`, `right_left_ir`, `right_right_ir`, and
+`right_dual_ir`.
+
+Or auto-pick the first three camera indexes that OpenCV can read:
+
+```bash
+uv run yamctl cameras --auto-count 3 --host 0.0.0.0 --port 8770
+```
+
+Expose that single socket through ngrok:
+
+```bash
+ngrok http 8770
+```
+
+Connect to:
+
+```text
+wss://<ngrok-id>.ngrok-free.app/cameras
+```
+
+Protocol:
+
+```json
+{"type":"get_all_frames","bundle":true}
+{"type":"get_frame","camera_id":"top"}
+{"type":"subscribe","fps":5,"cameras":"all","bundle":true}
+{"type":"stop"}
+```
+
+Debug all three frames:
+
+```bash
+uv run python scripts/multi_camera_ws_client.py \
+  ws://127.0.0.1:8770/cameras \
+  --output-dir logs/multi-camera-check
+```
+
+Open a real-time browser viewer:
+
+```bash
+open web/multi_camera_viewer.html
+```
+
+For ngrok, paste the `wss://.../cameras` URL into the viewer, or open it with a
+query string:
+
+```text
+web/multi_camera_viewer.html?ws=wss://<ngrok-id>.ngrok-free.app/cameras&autoconnect=1
+```
+
 The default hybrid path is now the local one-arm LeRobot ACT endpoint. Start it
 with a trained policy checkpoint:
 

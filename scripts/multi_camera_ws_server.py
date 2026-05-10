@@ -1,0 +1,530 @@
+#!/usr/bin/env python3
+"""Serve multiple local cameras through one WebSocket endpoint."""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import threading
+import time
+from dataclasses import dataclass
+from typing import Any
+
+
+@dataclass(frozen=True)
+class CameraSpec:
+    camera_id: str
+    driver: str
+    value: str
+
+    @property
+    def index(self) -> int | None:
+        if self.driver != "opencv":
+            return None
+        return int(self.value)
+
+
+def _parse_camera_specs(value: str) -> list[CameraSpec]:
+    specs: list[CameraSpec] = []
+    for item in value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        parts = item.split(":")
+        if len(parts) == 1:
+            index_text = parts[0]
+            specs.append(CameraSpec(camera_id=f"camera_{index_text}", driver="opencv", value=index_text))
+            continue
+        if len(parts) == 2:
+            camera_id, index_text = parts
+            driver = "opencv"
+            value_text = index_text
+        elif len(parts) == 3:
+            camera_id, driver, value_text = parts
+        else:
+            raise argparse.ArgumentTypeError(f"invalid camera spec: {item!r}")
+        camera_id = camera_id.strip()
+        if not camera_id:
+            raise argparse.ArgumentTypeError(f"invalid camera spec: {item!r}")
+        driver = driver.strip().lower()
+        value_text = value_text.strip().lower()
+        if driver == "cv":
+            driver = "opencv"
+        if driver == "opencv":
+            int(value_text)
+            specs.append(CameraSpec(camera_id=camera_id, driver=driver, value=value_text))
+        elif driver == "orbbec":
+            modes = ["color", "depth", "ir", "left_ir", "right_ir", "dual_ir"] if value_text == "all" else [value_text]
+            valid_modes = {"color", "depth", "ir", "left_ir", "right_ir", "dual_ir"}
+            for mode in modes:
+                if mode not in valid_modes:
+                    raise argparse.ArgumentTypeError(f"invalid Orbbec mode: {mode!r}")
+                mode_id = camera_id if value_text != "all" else f"{camera_id}_{mode}"
+                specs.append(CameraSpec(camera_id=mode_id, driver=driver, value=mode))
+        else:
+            raise argparse.ArgumentTypeError(f"invalid camera driver: {driver!r}")
+    if not specs:
+        raise argparse.ArgumentTypeError("at least one camera spec is required")
+    return specs
+
+
+def _probe_camera_indexes(max_index: int, width: int, height: int) -> list[int]:
+    import cv2
+
+    indexes: list[int] = []
+    for index in range(max_index + 1):
+        cap = cv2.VideoCapture(index)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        ok = False
+        if cap.isOpened():
+            ok, frame = cap.read()
+            ok = bool(ok and frame is not None)
+        cap.release()
+        if ok:
+            indexes.append(index)
+    return indexes
+
+
+def _auto_camera_specs(count: int, max_index: int, width: int, height: int) -> list[CameraSpec]:
+    indexes = _probe_camera_indexes(max_index, width, height)
+    if len(indexes) < count:
+        raise RuntimeError(f"needed {count} cameras, but only opened indexes {indexes}")
+    default_ids = ["front", "top", "wrist"]
+    return [
+        CameraSpec(camera_id=default_ids[i] if i < len(default_ids) else f"camera_{i}", driver="opencv", value=str(index))
+        for i, index in enumerate(indexes[:count])
+    ]
+
+
+def _jpeg_payload(camera_id: str, source: str, jpeg: bytes | None, captured_at: float | None, error: str | None) -> dict[str, Any]:
+    if jpeg is None:
+        return {
+            "type": "warming_up",
+            "camera_id": camera_id,
+            "camera_index": source,
+            "source": source,
+            "error": error,
+            "sent_at": time.time(),
+        }
+    return {
+        "type": "frame",
+        "camera_id": camera_id,
+        "camera_index": source,
+        "source": source,
+        "content_type": "image/jpeg",
+        "encoding": "base64",
+        "captured_at": captured_at,
+        "sent_at": time.time(),
+        "data": base64.b64encode(jpeg).decode("ascii"),
+    }
+
+
+class OpenCvCameraFeed:
+    def __init__(self, spec: CameraSpec, *, width: int, height: int, quality: int):
+        import cv2
+
+        self.cv2 = cv2
+        self.spec = spec
+        self.quality = quality
+        self.lock = threading.Lock()
+        self.latest_jpeg: bytes | None = None
+        self.latest_t: float | None = None
+        self.error: str | None = None
+        self.stop = threading.Event()
+        assert spec.index is not None
+        self.cap = cv2.VideoCapture(spec.index)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        if not self.cap.isOpened():
+            self.cap.release()
+            raise RuntimeError(f"{spec.camera_id}: could not open camera index {spec.index}")
+
+    def start(self) -> threading.Thread:
+        thread = threading.Thread(target=self.run, name=f"camera-{self.spec.camera_id}", daemon=True)
+        thread.start()
+        return thread
+
+    def run(self) -> None:
+        while not self.stop.is_set():
+            ok, frame = self.cap.read()
+            if not ok or frame is None:
+                self.error = "frame_read_failed"
+                time.sleep(0.05)
+                continue
+            ok, encoded = self.cv2.imencode(
+                ".jpg",
+                frame,
+                [int(self.cv2.IMWRITE_JPEG_QUALITY), self.quality],
+            )
+            if ok:
+                with self.lock:
+                    self.latest_jpeg = encoded.tobytes()
+                    self.latest_t = time.time()
+                    self.error = None
+            time.sleep(0.001)
+
+    def metadata(self) -> dict[str, Any]:
+        return {"camera_id": self.spec.camera_id, "camera_index": self.spec.index, "driver": "opencv"}
+
+    def frame_payload(self) -> dict[str, Any]:
+        with self.lock:
+            jpeg = self.latest_jpeg
+            captured_at = self.latest_t
+            error = self.error
+        return _jpeg_payload(self.spec.camera_id, str(self.spec.index), jpeg, captured_at, error)
+
+    def close(self) -> None:
+        self.stop.set()
+        self.cap.release()
+
+
+def _orbbec_video_profile(pipeline, sensor_type):
+    profile_list = pipeline.get_stream_profile_list(sensor_type)
+    return profile_list.get_default_video_stream_profile()
+
+
+def _normalize_gray_image(data):
+    import cv2
+    import numpy as np
+
+    image = cv2.normalize(data, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+    return cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+
+
+def _orbbec_ir_image(frame):
+    import cv2
+    import numpy as np
+    from pyorbbecsdk import OBFormat
+
+    if frame is None:
+        return None
+    frame = frame.as_video_frame()
+    width = frame.get_width()
+    height = frame.get_height()
+    fmt = frame.get_format()
+    raw = frame.get_data()
+    if fmt == OBFormat.MJPG:
+        decoded = cv2.imdecode(np.asanyarray(raw), cv2.IMREAD_GRAYSCALE)
+        return cv2.cvtColor(decoded, cv2.COLOR_GRAY2BGR) if decoded is not None else None
+    if fmt == OBFormat.Y8:
+        data = np.frombuffer(raw, dtype=np.uint8).reshape((height, width))
+    else:
+        data = np.frombuffer(raw, dtype=np.uint16).reshape((height, width))
+    return _normalize_gray_image(data)
+
+
+def _orbbec_depth_image(frame):
+    import cv2
+    import numpy as np
+    from pyorbbecsdk import OBFormat
+
+    if frame is None or frame.get_format() != OBFormat.Y16:
+        return None
+    width = frame.get_width()
+    height = frame.get_height()
+    depth = np.frombuffer(frame.get_data(), dtype=np.uint16).reshape((height, width))
+    depth = np.where((depth > 20) & (depth < 10000), depth, 0).astype(np.uint16)
+    normalized = cv2.normalize(depth, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+    return cv2.applyColorMap(normalized, cv2.COLORMAP_JET)
+
+
+def _orbbec_color_image(frame):
+    import cv2
+    import numpy as np
+    from pyorbbecsdk import OBFormat
+
+    if frame is None:
+        return None
+    frame = frame.as_video_frame()
+    width = frame.get_width()
+    height = frame.get_height()
+    fmt = frame.get_format()
+    raw = frame.get_data()
+    if fmt == OBFormat.RGB:
+        rgb = np.frombuffer(raw, dtype=np.uint8).reshape((height, width, 3))
+        return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    if fmt == OBFormat.BGR:
+        return np.frombuffer(raw, dtype=np.uint8).reshape((height, width, 3))
+    if fmt == OBFormat.MJPG:
+        return cv2.imdecode(np.asanyarray(raw), cv2.IMREAD_COLOR)
+    if fmt in (OBFormat.YUYV, OBFormat.YUY2):
+        yuyv = np.frombuffer(raw, dtype=np.uint8).reshape((height, width, 2))
+        return cv2.cvtColor(yuyv, cv2.COLOR_YUV2BGR_YUY2)
+    return None
+
+
+class OrbbecSdkFeed:
+    def __init__(self, specs: list[CameraSpec], *, quality: int):
+        self.specs = specs
+        self.quality = quality
+        self.lock = threading.Lock()
+        self.latest_jpegs: dict[str, bytes] = {}
+        self.latest_t: dict[str, float] = {}
+        self.errors: dict[str, str] = {}
+        self.stop = threading.Event()
+        self.pipeline = None
+
+    def start(self) -> threading.Thread:
+        thread = threading.Thread(target=self.run, name="camera-orbbec-sdk", daemon=True)
+        thread.start()
+        return thread
+
+    def metadata(self) -> dict[str, Any]:
+        raise RuntimeError("OrbbecSdkFeed contains multiple logical feeds")
+
+    def logical_feeds(self) -> list["OrbbecLogicalFeed"]:
+        return [OrbbecLogicalFeed(self, spec) for spec in self.specs]
+
+    def run(self) -> None:
+        import cv2
+        from pyorbbecsdk import Config, OBFrameType, OBSensorType, Pipeline
+
+        mode_map = {
+            "color": (OBSensorType.COLOR_SENSOR, OBFrameType.COLOR_FRAME, _orbbec_color_image),
+            "depth": (OBSensorType.DEPTH_SENSOR, OBFrameType.DEPTH_FRAME, _orbbec_depth_image),
+            "ir": (OBSensorType.IR_SENSOR, OBFrameType.IR_FRAME, _orbbec_ir_image),
+            "left_ir": (OBSensorType.LEFT_IR_SENSOR, OBFrameType.LEFT_IR_FRAME, _orbbec_ir_image),
+            "right_ir": (OBSensorType.RIGHT_IR_SENSOR, OBFrameType.RIGHT_IR_FRAME, _orbbec_ir_image),
+        }
+        enabled: dict[str, tuple[Any, Any]] = {}
+        try:
+            pipeline = Pipeline()
+            config = Config()
+            for spec in self.specs:
+                modes = ("left_ir", "right_ir") if spec.value == "dual_ir" else (spec.value,)
+                for mode in modes:
+                    if mode in enabled:
+                        continue
+                    sensor_type, frame_type, decoder = mode_map[mode]
+                    try:
+                        config.enable_stream(_orbbec_video_profile(pipeline, sensor_type))
+                        enabled[mode] = (frame_type, decoder)
+                    except Exception as exc:
+                        self.errors[mode] = str(exc)
+            if not enabled:
+                raise RuntimeError("no Orbbec SDK streams could be enabled")
+            pipeline.start(config)
+            self.pipeline = pipeline
+            while not self.stop.is_set():
+                frames = pipeline.wait_for_frames(1000)
+                if frames is None:
+                    continue
+                for spec in self.specs:
+                    try:
+                        if spec.value == "dual_ir":
+                            left = self._decode_orbbec_frame(frames, "left_ir", enabled)
+                            right = self._decode_orbbec_frame(frames, "right_ir", enabled)
+                            image = None if left is None or right is None else cv2.hconcat([left, right])
+                        else:
+                            image = self._decode_orbbec_frame(frames, spec.value, enabled)
+                        if image is None:
+                            continue
+                        ok, encoded = cv2.imencode(".jpg", image, [int(cv2.IMWRITE_JPEG_QUALITY), self.quality])
+                        if ok:
+                            with self.lock:
+                                self.latest_jpegs[spec.camera_id] = encoded.tobytes()
+                                self.latest_t[spec.camera_id] = time.time()
+                                self.errors.pop(spec.camera_id, None)
+                    except Exception as exc:
+                        with self.lock:
+                            self.errors[spec.camera_id] = str(exc)
+        except Exception as exc:
+            with self.lock:
+                for spec in self.specs:
+                    self.errors[spec.camera_id] = str(exc)
+        finally:
+            if self.pipeline is not None:
+                try:
+                    self.pipeline.stop()
+                except Exception:
+                    pass
+                self.pipeline = None
+
+    def _decode_orbbec_frame(self, frames, mode: str, enabled: dict[str, tuple[Any, Any]]):
+        if mode not in enabled:
+            return None
+        frame_type, decoder = enabled[mode]
+        return decoder(frames.get_frame(frame_type))
+
+    def frame_payload(self, spec: CameraSpec) -> dict[str, Any]:
+        with self.lock:
+            jpeg = self.latest_jpegs.get(spec.camera_id)
+            captured_at = self.latest_t.get(spec.camera_id)
+            error = self.errors.get(spec.camera_id) or self.errors.get(spec.value)
+        return _jpeg_payload(spec.camera_id, f"orbbec:{spec.value}", jpeg, captured_at, error)
+
+    def close(self) -> None:
+        self.stop.set()
+
+
+class OrbbecLogicalFeed:
+    def __init__(self, source: OrbbecSdkFeed, spec: CameraSpec):
+        self.source = source
+        self.spec = spec
+
+    def metadata(self) -> dict[str, Any]:
+        return {"camera_id": self.spec.camera_id, "camera_index": f"orbbec:{self.spec.value}", "driver": "orbbec"}
+
+    def frame_payload(self) -> dict[str, Any]:
+        return self.source.frame_payload(self.spec)
+
+    def close(self) -> None:
+        pass
+
+
+class MultiCameraServer:
+    def __init__(self, feeds: list[Any]):
+        self.feeds = {feed.spec.camera_id: feed for feed in feeds}
+
+    def hello(self) -> dict[str, Any]:
+        return {
+            "type": "hello",
+            "commands": ["get_frame", "get_all_frames", "subscribe", "stop"],
+            "encoding": "base64",
+            "cameras": [feed.metadata() for feed in self.feeds.values()],
+        }
+
+    def selected_feeds(self, message: dict[str, Any]) -> list[CameraFeed]:
+        requested = message.get("cameras") or message.get("camera_ids") or message.get("camera_id") or "all"
+        if requested == "all" or requested is None:
+            return list(self.feeds.values())
+        if isinstance(requested, str):
+            requested = [requested]
+        selected = []
+        for camera_id in requested:
+            feed = self.feeds.get(str(camera_id))
+            if feed is not None:
+                selected.append(feed)
+        return selected
+
+    def send_frames(self, ws, message: dict[str, Any]) -> None:
+        feeds = self.selected_feeds(message)
+        if not feeds:
+            ws.send(json.dumps({"type": "error", "error": "no matching cameras"}))
+            return
+        bundle = bool(message.get("bundle", False))
+        frames = [feed.frame_payload() for feed in feeds]
+        if bundle:
+            ws.send(json.dumps({"type": "frames", "sent_at": time.time(), "frames": frames}))
+        else:
+            for frame in frames:
+                ws.send(json.dumps(frame))
+
+
+def _start_ws_server(camera_server: MultiCameraServer, host: str, port: int):
+    from websockets.exceptions import ConnectionClosed
+    from websockets.sync.server import serve
+
+    def handler(ws) -> None:
+        ws.send(json.dumps(camera_server.hello()))
+        try:
+            while True:
+                raw = ws.recv(timeout=None)
+                try:
+                    message = json.loads(raw.decode("utf-8") if isinstance(raw, bytes) else raw)
+                except Exception:
+                    ws.send(json.dumps({"type": "error", "error": "expected JSON message"}))
+                    continue
+
+                command = message.get("type") or message.get("command") or "get_all_frames"
+                if command in {"get_frame", "frame", "get_all_frames"}:
+                    if command == "get_all_frames":
+                        message["cameras"] = "all"
+                    camera_server.send_frames(ws, message)
+                elif command == "subscribe":
+                    fps = float(message.get("fps") or 5.0)
+                    fps = min(max(fps, 0.1), 30.0)
+                    interval = 1.0 / fps
+                    ws.send(
+                        json.dumps(
+                            {
+                                "type": "subscribed",
+                                "fps": fps,
+                                "cameras": [feed.spec.camera_id for feed in camera_server.selected_feeds(message)],
+                            }
+                        )
+                    )
+                    while True:
+                        camera_server.send_frames(ws, message)
+                        try:
+                            control = ws.recv(timeout=interval)
+                        except TimeoutError:
+                            continue
+                        try:
+                            control_message = json.loads(control.decode("utf-8") if isinstance(control, bytes) else control)
+                        except Exception:
+                            continue
+                        if control_message.get("type") == "stop":
+                            ws.send(json.dumps({"type": "stopped"}))
+                            break
+                        if control_message.get("type") in {"get_frame", "get_all_frames"}:
+                            camera_server.send_frames(ws, control_message)
+                elif command == "stop":
+                    ws.send(json.dumps({"type": "stopped"}))
+                    return
+                else:
+                    ws.send(json.dumps({"type": "error", "error": f"unknown command: {command}"}))
+        except (ConnectionClosed, EOFError):
+            return
+
+    server = serve(handler, host, port, max_size=32 * 1024 * 1024)
+    server.serve_forever()
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Serve multiple camera feeds through one WebSocket endpoint.")
+    parser.add_argument("--camera-specs", help="Comma-separated id:index list, e.g. front:0,top:1,wrist:2.")
+    parser.add_argument("--auto-count", type=int, default=0, help="Probe and use the first N working cameras.")
+    parser.add_argument("--max-camera-index", type=int, default=12)
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=8770)
+    parser.add_argument("--width", type=int, default=640)
+    parser.add_argument("--height", type=int, default=360)
+    parser.add_argument("--quality", type=int, default=80)
+    args = parser.parse_args()
+
+    if args.camera_specs:
+        specs = _parse_camera_specs(args.camera_specs)
+    elif args.auto_count:
+        specs = _auto_camera_specs(args.auto_count, args.max_camera_index, args.width, args.height)
+    else:
+        parser.error("pass --camera-specs or --auto-count")
+
+    feeds: list[Any] = []
+    opencv_specs = [spec for spec in specs if spec.driver == "opencv"]
+    orbbec_specs = [spec for spec in specs if spec.driver == "orbbec"]
+    feeds.extend(OpenCvCameraFeed(spec, width=args.width, height=args.height, quality=args.quality) for spec in opencv_specs)
+    orbbec_feed = OrbbecSdkFeed(orbbec_specs, quality=args.quality) if orbbec_specs else None
+    if orbbec_feed is not None:
+        feeds.extend(orbbec_feed.logical_feeds())
+    for feed in feeds:
+        if isinstance(feed, OrbbecLogicalFeed):
+            continue
+        feed.start()
+    if orbbec_feed is not None:
+        orbbec_feed.start()
+    camera_server = MultiCameraServer(feeds)
+    print(
+        json.dumps(
+            {
+                "type": "multi_camera_server",
+                "url": f"ws://{args.host}:{args.port}/cameras",
+                "cameras": camera_server.hello()["cameras"],
+            }
+        ),
+        flush=True,
+    )
+    try:
+        _start_ws_server(camera_server, args.host, args.port)
+    finally:
+        for feed in feeds:
+            feed.close()
+        if orbbec_feed is not None:
+            orbbec_feed.close()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
