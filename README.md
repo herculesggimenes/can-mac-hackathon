@@ -22,10 +22,14 @@ uv sync
 
 ### CAN bridge (requires a CANable 2.0 adapter)
 
+Single arm (gs_usb firmware, USB IDs **1d50:606f**):
+
 ```bash
 cd can-bridge && cargo build --release
 ./target/release/can-bridge  # listens on /tmp/can0.sock
 ```
+
+Two arms on macOS: start both Unix sockets with **`can-bridge/start_bimanual_bridges.sh`**. That script runs the Rust bridge on **`can0`** and either a second Rust **`can-bridge 1`** or, if the second dongle is CDC/SLCAN only, **`slcan_bridge.py`** on **`/tmp/can1.sock`**. Set **`YAM_SLCAN_SERIAL=/dev/cu.usbmodem…`** if the wrong serial device is chosen. **`uv run yamctl status`** reports **`can_socket`** and **`can1_socket`**.
 
 ## Run
 
@@ -64,14 +68,12 @@ By default, model runs stop if any motor MOS temperature exceeds `55 C` or
 rotor temperature exceeds `100 C`.
 Gripper commands are clamped to normalized joint 7 range `[0.01, 0.59]`.
 
-For longer and faster motion, set the rollout controls directly:
+For longer rollouts, tune iteration count and how many trajectory rows you execute per inference:
 
 ```bash
 uv run yamctl hybrid "put bread in toaster" \
   --max-iterations 30 \
   --execute-action-steps 3 \
-  --max-speed 0.05 \
-  --command-dt 0.25 \
   --hz 0.5
 ```
 

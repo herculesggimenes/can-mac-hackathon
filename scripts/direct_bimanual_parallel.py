@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Direct local YAM joint control without Modal policy inference."""
+"""Move left and right YAM arms together (same timestep for each joint command)."""
 
 from __future__ import annotations
 
@@ -13,10 +13,10 @@ from pathlib import Path
 
 import numpy as np
 
-
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "can-bridge"))
 sys.path.insert(0, str(ROOT / "scripts"))
+
 STOP_FILE = ROOT / "HARD_STOP"
 STOP_REQUESTED = False
 
@@ -57,13 +57,35 @@ def _safety_report(robot) -> dict:
         }
 
 
-def _safety_block_reason(report: dict, args: argparse.Namespace) -> dict | None:
+def _safety_pair(robot_l, robot_r) -> dict:
+    a = _safety_report(robot_l)
+    b = _safety_report(robot_r)
+    if not a.get("available", False) or not b.get("available", False):
+        return {"available": False}
+    return {
+        "available": True,
+        "max_temp_mos": max(a["max_temp_mos"], b["max_temp_mos"]),
+        "max_temp_rotor": max(a["max_temp_rotor"], b["max_temp_rotor"]),
+        "temp_mos_left": a["max_temp_mos"],
+        "temp_mos_right": b["max_temp_mos"],
+    }
+
+
+def _safety_block_reason_pair(report: dict, args: argparse.Namespace) -> dict | None:
     if not report.get("available", False):
         return {"execution_blocked": "joint_state_unavailable"}
     if report["max_temp_mos"] > args.max_temp_mos:
-        return {"execution_blocked": "mos_temperature_too_high", "max_temp_mos": report["max_temp_mos"], "limit": args.max_temp_mos}
+        return {
+            "execution_blocked": "mos_temperature_too_high",
+            "max_temp_mos": report["max_temp_mos"],
+            "limit": args.max_temp_mos,
+        }
     if report["max_temp_rotor"] > args.max_temp_rotor:
-        return {"execution_blocked": "rotor_temperature_too_high", "max_temp_rotor": report["max_temp_rotor"], "limit": args.max_temp_rotor}
+        return {
+            "execution_blocked": "rotor_temperature_too_high",
+            "max_temp_rotor": report["max_temp_rotor"],
+            "limit": args.max_temp_rotor,
+        }
     return None
 
 
@@ -96,72 +118,119 @@ def run(args: argparse.Namespace) -> int:
     from i2rt.robots.get_robot import get_yam_robot
     from i2rt.robots.utils import GripperType
 
-    robot = get_yam_robot(
-        channel=args.channel,
+    robot_l = get_yam_robot(
+        channel=args.left_can,
+        gripper_type=GripperType.LINEAR_4310,
+        zero_gravity_mode=False,
+        clip_commands_to_joint_limits=False,
+    )
+    robot_r = get_yam_robot(
+        channel=args.right_can,
         gripper_type=GripperType.LINEAR_4310,
         zero_gravity_mode=False,
         clip_commands_to_joint_limits=False,
     )
     try:
-        current = np.asarray(robot.get_joint_pos(), dtype=float)
-        safety = _safety_report(robot)
-        print(json.dumps({"current": current.tolist(), "safety": safety}), flush=True)
-        block_reason = _safety_block_reason(safety, args)
-        if block_reason is not None:
-            print(json.dumps(block_reason), flush=True)
+        robot_l._limit_gripper_force = -1.0
+        robot_r._limit_gripper_force = -1.0
+
+        cur_l = np.asarray(robot_l.get_joint_pos(), dtype=float)
+        cur_r = np.asarray(robot_r.get_joint_pos(), dtype=float)
+        safety = _safety_pair(robot_l, robot_r)
+        print(
+            json.dumps(
+                {
+                    "left": cur_l.tolist(),
+                    "right": cur_r.tolist(),
+                    "safety": safety,
+                    "left_can": args.left_can,
+                    "right_can": args.right_can,
+                }
+            ),
+            flush=True,
+        )
+        block = _safety_block_reason_pair(safety, args)
+        if block is not None:
+            print(json.dumps(block), flush=True)
             return 1
+
         if args.read_only:
             print(
                 json.dumps(
                     {
-                        "direct_ok": True,
-                        "channel": args.channel,
-                        "note": "If you see DM motor errors or Bad file descriptor below, they often occur "
-                        "during shutdown after a successful read; clear DM faults if motors report errors.",
+                        "direct_both_ok": True,
+                        "note": "Shutdown noise after exit is common; separate DM faults per arm.",
                     }
                 ),
                 flush=True,
             )
             return 0
 
-        requested = _build_target(current, args)
-        target = _limit_target(current, requested, args)
-        print(json.dumps({"requested": requested.tolist(), "target": target.tolist(), "delta": (target - current).tolist()}), flush=True)
+        req_l = _build_target(cur_l, args)
+        req_r = _build_target(cur_r, args)
+        tgt_l = _limit_target(cur_l, req_l, args)
+        tgt_r = _limit_target(cur_r, req_r, args)
+        print(
+            json.dumps(
+                {
+                    "requested_left": req_l.tolist(),
+                    "requested_right": req_r.tolist(),
+                    "target_left": tgt_l.tolist(),
+                    "target_right": tgt_r.tolist(),
+                    "delta_left": (tgt_l - cur_l).tolist(),
+                    "delta_right": (tgt_r - cur_r).tolist(),
+                }
+            ),
+            flush=True,
+        )
 
         steps = max(1, args.steps)
         for index in range(1, steps + 1):
             if STOP_REQUESTED or STOP_FILE.exists():
                 print(json.dumps({"stopped": True, "step": index}), flush=True)
                 return 130
-            safety = _safety_report(robot)
-            block_reason = _safety_block_reason(safety, args)
-            if block_reason is not None:
-                print(json.dumps({"safety": safety}), flush=True)
-                print(json.dumps(block_reason), flush=True)
+            safety = _safety_pair(robot_l, robot_r)
+            block = _safety_block_reason_pair(safety, args)
+            if block is not None:
+                print(json.dumps(block), flush=True)
                 return 1
-            command = current + (index / steps) * (target - current)
-            robot.command_joint_pos(command)
-            print(json.dumps({"step": index, "steps": steps, "commanded": command.tolist()}), flush=True)
+            alpha = index / steps
+            cmd_l = cur_l + alpha * (tgt_l - cur_l)
+            cmd_r = cur_r + alpha * (tgt_r - cur_r)
+            robot_l.command_joint_pos(cmd_l)
+            robot_r.command_joint_pos(cmd_r)
+            print(
+                json.dumps(
+                    {
+                        "step": index,
+                        "steps": steps,
+                        "commanded_left": cmd_l.tolist(),
+                        "commanded_right": cmd_r.tolist(),
+                    }
+                ),
+                flush=True,
+            )
             if args.duration > 0:
                 time.sleep(args.duration / steps)
+        print(json.dumps({"direct_both_done": True}), flush=True)
         return 0
     finally:
-        try:
-            robot.close()
-        except Exception as exc:  # noqa: BLE001
-            print(json.dumps({"direct_close_error": repr(exc)}), flush=True)
+        for arm, name in ((robot_l, "left"), (robot_r, "right")):
+            try:
+                arm.close()
+            except Exception as exc:  # noqa: BLE001
+                print(json.dumps({f"{name}_close_error": repr(exc)}), flush=True)
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Direct local YAM joint control without Modal.")
-    parser.add_argument(
-        "--channel",
-        default=os.environ.get("YAM_DIRECT_CAN", "can0"),
-        help='SocketCAN iface for this arm (macOS bridges: "can0" -> /tmp/can0.sock). Default can0 = left in typical bimanual wiring.',
+    parser = argparse.ArgumentParser(
+        description="Command both YAM arms in parallel (same interpolation clock).",
     )
+    parser.add_argument("--left-can", default=os.environ.get("YAM_BIMANUAL_LEFT_CAN", "can0"))
+    parser.add_argument("--right-can", default=os.environ.get("YAM_BIMANUAL_RIGHT_CAN", "can1"))
     parser.add_argument("--target", type=lambda v: _parse_vector(v, name="--target"))
     parser.add_argument("--delta", type=lambda v: _parse_vector(v, name="--delta"))
-    parser.add_argument("--gripper", type=float, help="Set normalized joint 7/gripper command.")
+    parser.add_argument("--gripper", type=float)
     parser.add_argument("--duration", type=float, default=1.0)
     parser.add_argument("--steps", type=int, default=20)
     parser.add_argument("--max-delta", type=float, default=0.20)
@@ -175,7 +244,7 @@ def main() -> int:
     if not args.read_only and args.target is None and args.delta is None and args.gripper is None:
         parser.error(
             "need --read-only, --target, --delta, or --gripper. "
-            "Example: uv run yamctl direct --channel can0 --read-only"
+            "Example: uv run yamctl direct-both --delta \"0,0,0.35,0,0,0,0\" --duration 5 --steps 100 --max-delta 0.5"
         )
     return run(args)
 

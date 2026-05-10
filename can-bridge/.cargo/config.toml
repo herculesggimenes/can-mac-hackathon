@@ -1,0 +1,3 @@
+# Keep artifacts under can-bridge/target so scripts can rely on ./target/release/can-bridge
+[build]
+target-dir = "target"

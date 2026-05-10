@@ -2,7 +2,7 @@
 """Local YAM bridge for a Modal WebSocket policy service.
 
 By default this is observe-only and will not command hardware. Pass --execute to
-send returned actions to the robot after clipping and speed limiting.
+send returned actions to the robot after gripper range clamping (see min/max gripper flags).
 """
 
 from __future__ import annotations
@@ -12,6 +12,8 @@ import asyncio
 import base64
 import io
 import json
+import os
+import re
 import signal
 import sys
 import time
@@ -24,9 +26,37 @@ from PIL import Image
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "scripts"))
 sys.path.insert(0, str(ROOT / "can-bridge"))
 STOP_FILE = ROOT / "HARD_STOP"
 STOP_REQUESTED = False
+
+
+def socketcan_to_bridge_index(channel) -> int | None:
+    """Map SocketCAN-style names to the bridge index (Unix domain socket /tmp/can<N>.sock).
+
+    On macOS that socket may be served by the Rust can-bridge binary or by
+    slcan_bridge.py; both use the same protocol. Environment variables
+    YAM_BRIDGE_INDEX_LEFT and YAM_BRIDGE_INDEX_RIGHT override can_follower_l
+    and can_follower_r when the name has no trailing digit.
+    """
+
+    if channel is None:
+        return 0
+    if isinstance(channel, int):
+        return channel if channel >= 0 else None
+    s = str(channel)
+    if s == "can_follower_l":
+        return int(os.environ.get("YAM_BRIDGE_INDEX_LEFT", "0"))
+    if s == "can_follower_r":
+        return int(os.environ.get("YAM_BRIDGE_INDEX_RIGHT", "1"))
+    m = re.fullmatch(r"can(\d+)", s)
+    if m:
+        return int(m.group(1))
+    m = re.search(r"(\d+)$", s)
+    if m:
+        return int(m.group(1))
+    return None
 
 
 def _request_stop(_signum=None, _frame=None) -> None:
@@ -49,8 +79,10 @@ def _install_can_patch():
     def patched_bus(*args, **kwargs):
         interface = kwargs.get("interface", kwargs.get("bustype"))
         channel = kwargs.get("channel", args[0] if args else None)
-        if interface == "socketcan" and channel in {"can0", 0, None}:
-            return CanBridgeBus(channel=0)
+        if interface == "socketcan":
+            idx = socketcan_to_bridge_index(channel)
+            if idx is not None:
+                return CanBridgeBus(channel=idx)
         return orig(*args, **kwargs)
 
     can.interface.Bus = patched_bus
@@ -80,11 +112,6 @@ def _install_can_patch():
 
     GripperType.get_gripper_limits = patched_limits
     GripperType.get_gripper_needs_calibration = patched_cal
-
-
-def _clip_step(current: np.ndarray, target: np.ndarray, max_speed: float, dt: float) -> np.ndarray:
-    max_step = max_speed * max(dt, 1e-3)
-    return current + np.clip(target - current, -max_step, max_step)
 
 
 def _clip_command_for_hardware(commanded: np.ndarray, args: argparse.Namespace) -> np.ndarray:
@@ -125,8 +152,10 @@ class OpenCVCamera:
     def __init__(self, index: int, width: int = 640, height: int = 360):
         import cv2
 
+        from opencv_util import video_capture
+
         self._cv2 = cv2
-        self.cap = cv2.VideoCapture(index)
+        self.cap = video_capture(index)
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
         if not self.cap.isOpened():
@@ -149,15 +178,39 @@ def _rgb_from_camera_url(url: str) -> np.ndarray:
     return np.asarray(image)
 
 
-def _camera_payload(camera: OpenCVCamera | None, camera_url: str | None) -> dict:
+def _apply_right_camera_flip(rgb: np.ndarray, mode: str | None) -> np.ndarray:
+    """Match wrist camera mounting: flip before encoding for Molmo ``right`` / policy ``front``.
+
+    ``vertical`` corrects an upside-down camera (flip rows). ``horizontal`` mirrors left/right.
+    ``both`` flips both axes (180° rotation).
+    """
+
+    if not mode or mode == "none":
+        return np.asarray(rgb, dtype=np.uint8)
+    import cv2
+
+    code = {"vertical": 0, "horizontal": 1, "both": -1}.get(str(mode))
+    if code is None:
+        return np.asarray(rgb, dtype=np.uint8)
+    return cv2.flip(np.asarray(rgb, dtype=np.uint8), code)
+
+
+def _camera_payload(
+    camera: OpenCVCamera | None,
+    camera_url: str | None,
+    right_camera_flip: str = "none",
+) -> dict:
     if camera is None and not camera_url:
         return {}
     rgb = _rgb_from_camera_url(camera_url) if camera_url else camera.read_rgb()
-    encoded = _encode_rgb_jpeg_b64(rgb)
-    # MolmoAct2-BimanualYAM expects top/left/right. With one local webcam we
-    # intentionally duplicate the same frame for inspection; this is not the
-    # trained camera geometry.
-    return {"top": encoded, "left": encoded, "right": encoded}
+    rgb = _apply_right_camera_flip(rgb, right_camera_flip)
+    black = np.zeros_like(np.asarray(rgb, dtype=np.uint8), dtype=np.uint8)
+    # MolmoAct2-BimanualYAM expects top/left/right: overhead + left black; live feed on right only.
+    return {
+        "top": _encode_rgb_jpeg_b64(black),
+        "left": _encode_rgb_jpeg_b64(black),
+        "right": _encode_rgb_jpeg_b64(rgb),
+    }
 
 
 def _summarize_response(response: dict) -> str:
@@ -173,18 +226,57 @@ def _summarize_response(response: dict) -> str:
     return json.dumps(summary)
 
 
-def _extract_single_arm_target(response: dict, arm_slice: str, action_step: int) -> np.ndarray | None:
-    action = np.asarray(response.get("action", []), dtype=float)
+def _normalize_molmo_action_matrix(
+    action: np.ndarray,
+    *,
+    min_cols: int,
+) -> np.ndarray | None:
+    """Turn Modal ``action`` JSON into a 2D array ``(time, joints)``.
+
+    MolmoAct2-BimanualYAM commonly returns shape ``(1, num_steps, 14)`` (batch × time × joints).
+    ``np.squeeze`` collapses that to ``(num_steps, 14)``, but if the batch dimension is **not**
+    1 (e.g. ``(2, 30, 14)``), plain squeeze leaves a 3D tensor and we previously extracted **zero**
+    targets. We strip leading singleton dimensions and then take the **first** batch row if still 3D.
+    """
+
     if action.size == 0:
         return None
-    action = np.squeeze(action)
-    if action.ndim == 2:
-        step = int(np.clip(action_step, 0, action.shape[0] - 1))
-        action = action[step]
-    if action.shape[0] < 14:
-        return action[:7] if action.shape[0] >= 7 else None
+    a = np.asarray(action, dtype=float)
+    if a.dtype == object:
+        return None
+    while a.ndim > 2 and a.shape[0] == 1:
+        a = a[0]
+    if a.ndim == 3:
+        if a.shape[-1] < min_cols:
+            return None
+        a = a[0]
+    a = np.squeeze(a)
+    if a.ndim == 1:
+        if a.shape[0] >= min_cols:
+            a = a[None, :]
+        else:
+            return None
+    if a.ndim != 2:
+        return None
+    if a.shape[1] < min_cols:
+        if a.shape[0] >= min_cols and a.shape[1] >= 2:
+            a = a.T
+        if a.shape[1] < min_cols:
+            return None
+    return a
+
+
+def _extract_single_arm_target(response: dict, arm_slice: str, action_step: int) -> np.ndarray | None:
+    action = np.asarray(response.get("action", []), dtype=float)
+    action = _normalize_molmo_action_matrix(action, min_cols=7)
+    if action is None:
+        return None
+    step = int(np.clip(action_step, 0, action.shape[0] - 1))
+    row = action[step]
+    if row.shape[0] < 14:
+        return row[:7] if row.shape[0] >= 7 else None
     start = 0 if arm_slice == "first" else 7
-    return action[start : start + 7]
+    return row[start : start + 7]
 
 
 def _extract_single_arm_actions(
@@ -194,12 +286,8 @@ def _extract_single_arm_actions(
     execute_action_steps: int,
 ) -> list[np.ndarray]:
     action = np.asarray(response.get("action", []), dtype=float)
-    if action.size == 0:
-        return []
-    action = np.squeeze(action)
-    if action.ndim == 1:
-        action = action[None, :]
-    if action.ndim != 2:
+    action = _normalize_molmo_action_matrix(action, min_cols=7)
+    if action is None:
         return []
 
     start_step = int(np.clip(action_step, 0, action.shape[0] - 1))
@@ -213,6 +301,28 @@ def _extract_single_arm_actions(
             targets.append(step[arm_start : arm_start + 7])
         elif step.shape[0] >= 7:
             targets.append(step[:7])
+    return targets
+
+
+def _extract_bimanual_actions(
+    response: dict,
+    action_step: int,
+    execute_action_steps: int,
+) -> list[np.ndarray]:
+    """Return a list of length-14 vectors (left 7 + right 7) per trajectory timestep."""
+
+    action = np.asarray(response.get("action", []), dtype=float)
+    action = _normalize_molmo_action_matrix(action, min_cols=14)
+    if action is None:
+        return []
+
+    start_step = int(np.clip(action_step, 0, action.shape[0] - 1))
+    stop_step = min(action.shape[0], start_step + max(1, execute_action_steps))
+    selected = action[start_step:stop_step]
+
+    targets: list[np.ndarray] = []
+    for step in selected:
+        targets.append(np.asarray(step[:14], dtype=float))
     return targets
 
 
@@ -241,6 +351,20 @@ def _safety_report(robot) -> dict:
         }
 
 
+def _safety_report_pair(robot_l, robot_r) -> dict:
+    a = _safety_report(robot_l)
+    b = _safety_report(robot_r)
+    if not a.get("available", False) or not b.get("available", False):
+        return {"available": False}
+    return {
+        "available": True,
+        "temp_mos": a["temp_mos"] + b["temp_mos"],
+        "temp_rotor": a["temp_rotor"] + b["temp_rotor"],
+        "max_temp_mos": max(a["max_temp_mos"], b["max_temp_mos"]),
+        "max_temp_rotor": max(a["max_temp_rotor"], b["max_temp_rotor"]),
+    }
+
+
 def _safety_block_reason(report: dict, args: argparse.Namespace) -> dict | None:
     if not report.get("available", False):
         return {"execution_blocked": "joint_state_unavailable"}
@@ -257,24 +381,6 @@ def _safety_block_reason(report: dict, args: argparse.Namespace) -> dict | None:
             "limit": args.max_temp_rotor,
         }
     return None
-
-
-def _prepare_target_for_execution(target: np.ndarray, state: np.ndarray, args: argparse.Namespace) -> tuple[np.ndarray, dict | None]:
-    target = np.asarray(target, dtype=float).copy()
-    requested_gripper = float(target[6])
-    target[6] = float(np.clip(target[6], args.min_gripper_command, args.max_gripper_command))
-
-    arm_delta = target[:6] - np.asarray(state[:6], dtype=float)
-    max_abs_arm_delta = float(np.max(np.abs(arm_delta)))
-    if max_abs_arm_delta > args.max_target_delta:
-        return target, {
-            "execution_blocked": "arm_target_delta_too_large",
-            "max_abs_arm_delta": max_abs_arm_delta,
-            "limit": args.max_target_delta,
-            "requested_gripper": requested_gripper,
-            "clamped_gripper": float(target[6]),
-        }
-    return target, None
 
 
 async def _policy_request(args: argparse.Namespace, payload: dict) -> dict:
@@ -309,11 +415,10 @@ async def run_bridge(args: argparse.Namespace) -> None:
         channel="can0",
         gripper_type=GripperType.LINEAR_4310,
         zero_gravity_mode=False,
+        clip_commands_to_joint_limits=False,
     )
     initial_state = robot.get_joint_pos()
     _apply_current_gripper_cap(initial_state, args)
-    last_command = _clip_command_for_hardware(initial_state, args)
-    last_time = time.time()
     camera = None
     if not args.no_camera and not args.camera_url:
         camera = OpenCVCamera(args.camera_index)
@@ -336,7 +441,7 @@ async def run_bridge(args: argparse.Namespace) -> None:
                 "task": args.task,
                 "state": state.tolist(),
                 "state_format": "single_arm_yam_7d",
-                "images": _camera_payload(camera, args.camera_url),
+                "images": _camera_payload(camera, args.camera_url, args.right_camera_flip),
                 "num_steps": args.num_steps,
             }
             response = await _policy_request(args, payload)
@@ -368,18 +473,8 @@ async def run_bridge(args: argparse.Namespace) -> None:
                             blocked = True
                             break
 
-                        target, target_block = _prepare_target_for_execution(target, state, args)
-                        if target_block is not None:
-                            print(json.dumps(target_block), flush=True)
-                            blocked = True
-                            break
-                        now = time.time()
-                        command_dt = args.command_dt if args.command_dt > 0 else now - last_time
-                        commanded = _clip_step(last_command, target, args.max_speed, command_dt)
-                        commanded = _clip_command_for_hardware(commanded, args)
+                        commanded = _clip_command_for_hardware(np.asarray(target, dtype=float), args)
                         robot.command_joint_pos(commanded)
-                        last_command = commanded
-                        last_time = now
                         executed_steps += 1
                         print(
                             json.dumps(
@@ -397,17 +492,8 @@ async def run_bridge(args: argparse.Namespace) -> None:
                     if blocked:
                         break
                 elif target is not None and target.shape[0] >= 7:
-                    target, target_block = _prepare_target_for_execution(target, state, args)
-                    if target_block is not None:
-                        print(json.dumps(target_block), flush=True)
-                        break
-                    now = time.time()
-                    command_dt = args.command_dt if args.command_dt > 0 else now - last_time
-                    commanded = _clip_step(last_command, target, args.max_speed, command_dt)
-                    commanded = _clip_command_for_hardware(commanded, args)
+                    commanded = _clip_command_for_hardware(np.asarray(target, dtype=float), args)
                     robot.command_joint_pos(commanded)
-                    last_command = commanded
-                    last_time = now
                     print(json.dumps({"commanded": commanded.tolist(), "target": target.tolist()}), flush=True)
                 else:
                     print("Skipping execute: could not extract a 7D single-arm action", flush=True)
@@ -431,8 +517,6 @@ def main() -> int:
     parser.add_argument("--hz", type=float, default=2.0)
     parser.add_argument("--num-steps", type=int, default=10)
     parser.add_argument("--http-timeout", type=float, default=300.0)
-    parser.add_argument("--max-speed", type=float, default=0.03, help="Max joint command speed in rad/s or normalized gripper/s")
-    parser.add_argument("--max-target-delta", type=float, default=0.35, help="Refuse execution if any target joint is farther than this from current state.")
     parser.add_argument("--min-gripper-command", type=float, default=0.01, help="Clamp gripper policy commands to at least this normalized value.")
     parser.add_argument("--max-gripper-command", type=float, default=0.59, help="Clamp gripper policy commands to at most this normalized value.")
     parser.add_argument("--cap-gripper-at-current-open", action="store_true", help="Use the startup gripper position as the max normalized open command for this run.")
@@ -441,12 +525,17 @@ def main() -> int:
     parser.add_argument("--max-iterations", type=int, default=0, help="Stop after N policy calls; 0 means run until hard stop.")
     parser.add_argument("--camera-index", type=int, default=0)
     parser.add_argument("--camera-url", help="HTTP URL returning a JPEG/PNG frame, e.g. http://127.0.0.1:8766/frame.jpg")
+    parser.add_argument(
+        "--right-camera-flip",
+        choices=["none", "vertical", "horizontal", "both"],
+        default="none",
+        help="Flip wrist camera before policy right/front: both=180°, vertical/horizontal=single axis, none=raw.",
+    )
     parser.add_argument("--no-camera", action="store_true")
     parser.add_argument("--arm-slice", choices=["first", "second"], default="first")
     parser.add_argument("--action-step", type=int, default=0)
     parser.add_argument("--execute-action-steps", type=int, default=1, help="Execute this many consecutive policy trajectory steps per inference.")
     parser.add_argument("--action-step-delay", type=float, default=0.0, help="Delay between local trajectory step commands.")
-    parser.add_argument("--command-dt", type=float, default=0.0, help="Fixed dt for speed clipping each trajectory command; 0 uses wall-clock dt.")
     parser.add_argument("--sample-only", action="store_true", help="Call Modal with the official MolmoAct2 sample. Does not touch the robot or CAN.")
     parser.add_argument("--execute", action="store_true", help="Actually command the local robot. Default is observe-only.")
     parser.add_argument("--force-execute-unsafe", action="store_true", help="Required in addition to --execute; still requires remote execute_ok=true.")

@@ -21,7 +21,16 @@ class CanBridgeBus(can.BusABC):
         super().__init__(channel=channel, **kwargs)
         socket_path = f"/tmp/can{channel}.sock"
         self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self._sock.connect(socket_path)
+        try:
+            self._sock.connect(socket_path)
+        except FileNotFoundError as exc:
+            raise FileNotFoundError(
+                f"{socket_path} not found. Create it with the Rust gs_usb bridge "
+                f"`./target/release/can-bridge {channel}` (needs CANable USB IDs 1d50:606f), "
+                f"or `can-bridge/slcan_bridge.py --socket {socket_path}` for CDC/SLCAN firmware. "
+                f"Bimanual macOS: run `can-bridge/start_bimanual_bridges.sh` "
+                f"(second dongle may use SLCAN + YAM_SLCAN_SERIAL if not gs_usb)."
+            ) from exc
         self._sock.setblocking(True)
         self.channel_info = f"can-bridge:{channel}"
         self._state = can.BusState.ACTIVE

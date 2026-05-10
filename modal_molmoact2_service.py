@@ -3,6 +3,12 @@
 Deploy:
     .venv/bin/modal deploy modal_molmoact2_service.py
 
+Override GPU at deploy time (faster = pricier), e.g.::
+
+    MOLMOACT2_GPU=H100 modal deploy modal_molmoact2_service.py
+
+Default GPU is set in ``MOLMOACT2_GPU`` (see below).
+
 The endpoint intentionally returns execute_ok=false. It is for inspecting model
 actions before a separate local process is allowed to command hardware.
 """
@@ -24,8 +30,11 @@ REPO_ID = "allenai/MolmoAct2-BimanualYAM"
 REPO_REVISION = "1249f2047e509bd3e4abd0b028ab49599b9b7ffa"
 NORM_TAG = "yam_dual_molmoact2"
 MIN_CONTAINERS = int(os.environ.get("MOLMOACT2_MIN_CONTAINERS", "1"))
-SCALEDOWN_WINDOW = int(os.environ.get("MOLMOACT2_SCALEDOWN_WINDOW", "1200"))
+# Seconds idle before Modal spins GPU container down; longer = fewer cold-starts (slow first infer).
+SCALEDOWN_WINDOW = int(os.environ.get("MOLMOACT2_SCALEDOWN_WINDOW", "7200"))
 PRELOAD_MODEL = os.environ.get("MOLMOACT2_PRELOAD_MODEL", "1") != "0"
+# Inference GPU (Modal ``@app.function(gpu=...)``). Default A100 vs former A10G for faster Molmo forward passes.
+MOLMOACT2_GPU = os.environ.get("MOLMOACT2_GPU", "A100")
 SAMPLE_TASK = "Place cups and plate in dishwasher rack, dispose of food waste, and organize remaining items."
 SAMPLE_STATE = [
     -0.06656748056411743,
@@ -213,7 +222,7 @@ def _predict(payload: dict[str, Any]) -> dict[str, Any]:
 
 @app.function(
     image=image,
-    gpu="A10G",
+    gpu=MOLMOACT2_GPU,
     timeout=60 * 30,
     min_containers=MIN_CONTAINERS,
     scaledown_window=SCALEDOWN_WINDOW,
@@ -233,6 +242,7 @@ def serve():
                     "repo_revision": REPO_REVISION,
                     "model_loaded": _MODEL is not None,
                     "execute_ok": False,
+                    "gpu": MOLMOACT2_GPU,
                 }
             else:
                 chunks = []
