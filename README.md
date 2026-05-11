@@ -56,6 +56,17 @@ Joint commands are fourteen numbers. Each arm has seven joints. Joint 7 of each
 arm is the normalized gripper command and is clamped by default to `[0.01,
 0.59]`.
 
+Run a bounded WebSocket motion demo:
+
+```bash
+uv run python scripts/yam_samba_dance_ws.py --dry-run
+uv run python scripts/yam_samba_dance_ws.py --duration 8 --loops 1
+```
+
+The demo checks that both arms are connected, ramps motion in/out, caps per-step
+joint deltas, leaves both grippers unchanged, and restores the observed baseline
+pose by default.
+
 ## Reconnect Behavior
 
 The server owns and supervises the bimanual bridge plus both arms:
@@ -104,10 +115,11 @@ The API still expects exactly two arms and 14D commands.
 Start the multi-camera WebSocket endpoint:
 
 ```bash
-uv run yamctl cameras \
-  --camera-specs front:0,top:1,wrist:2 \
+sudo /opt/homebrew/bin/uv run python scripts/multi_camera_ws_server.py \
   --host 0.0.0.0 \
-  --port 8770
+  --port 8770 \
+  --camera-specs 'right:1,left:2,top:orbbec:color,depth:orbbec:depth' \
+  --quality 80
 ```
 
 Endpoint:
@@ -121,9 +133,13 @@ Protocol:
 ```json
 {"type":"get_all_frames","bundle":true}
 {"type":"get_frame","camera_id":"top"}
+{"type":"reset_camera","camera_id":"depth"}
 {"type":"subscribe","fps":5,"cameras":"all","bundle":true}
 {"type":"stop"}
 ```
+
+Use `reset_camera` for a stuck feed. OpenCV cameras reset independently; Orbbec
+logical feeds restart the shared Orbbec SDK worker.
 
 Orbbec depth frames include the normal JPEG preview plus raw metric depth when
 available:

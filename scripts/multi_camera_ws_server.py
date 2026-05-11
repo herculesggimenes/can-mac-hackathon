@@ -531,6 +531,7 @@ class OrbbecSdkFeed:
         self.stop = threading.Event()
         self.process: mp.Process | None = None
         self.queue: mp.Queue | None = None
+        self.reset_lock = threading.Lock()
         self._logged_modes: set[str] = set()
 
     def start(self) -> threading.Thread:
@@ -586,6 +587,35 @@ class OrbbecSdkFeed:
             self.queue = mp.Queue(maxsize=16)
         self.process = mp.Process(target=_orbbec_worker, args=(specs_data, self.quality, self.queue), daemon=True)
         self.process.start()
+
+    def request_reset(self, camera_id: str | None = None) -> None:
+        threading.Thread(
+            target=self._reset_worker,
+            args=(camera_id,),
+            name="camera-orbbec-sdk-reset",
+            daemon=True,
+        ).start()
+
+    def _reset_worker(self, camera_id: str | None = None) -> None:
+        if not self.reset_lock.acquire(blocking=False):
+            return
+        try:
+            with self.lock:
+                affected_ids = [spec.camera_id for spec in self.specs]
+                for affected_id in affected_ids:
+                    self.errors[affected_id] = "resetting"
+                    self.latest_jpegs.pop(affected_id, None)
+                    self.latest_depth.pop(affected_id, None)
+                    self.latest_metadata.pop(affected_id, None)
+                    self.latest_t.pop(affected_id, None)
+            if self.process is not None and self.process.is_alive():
+                self.process.terminate()
+                self.process.join(timeout=2.0)
+            if self.process is not None and self.process.is_alive():
+                self.process.kill()
+                self.process.join(timeout=1.0)
+        finally:
+            self.reset_lock.release()
 
     def close(self) -> None:
         self.stop.set()
@@ -779,6 +809,9 @@ class OrbbecLogicalFeed:
 
     def frame_payload(self) -> dict[str, Any]:
         return self.source.frame_payload(self.spec)
+
+    def request_reset(self) -> None:
+        self.source.request_reset(self.spec.camera_id)
 
     def close(self) -> None:
         pass
